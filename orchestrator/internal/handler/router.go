@@ -28,7 +28,13 @@ func NewAPIHandler(orch *service.Orchestrator) *APIHandler {
 func (h *APIHandler) SetAnalyticsURL(analyticsURL string) {
 	if analyticsURL != "" {
 		if target, err := url.Parse(analyticsURL); err == nil {
-			h.analyticsProxy = httputil.NewSingleHostReverseProxy(target)
+			proxy := httputil.NewSingleHostReverseProxy(target)
+			originalDirector := proxy.Director
+			proxy.Director = func(req *http.Request) {
+				originalDirector(req)
+				req.Host = target.Host
+			}
+			h.analyticsProxy = proxy
 		}
 	}
 }
