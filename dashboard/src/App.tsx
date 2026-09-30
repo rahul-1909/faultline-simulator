@@ -6,8 +6,15 @@ import {
   Hash, ArrowUpRight, XCircle
 } from 'lucide-react';
 
-const ORCHESTRATOR_URL = (import.meta as any).env?.VITE_ORCHESTRATOR_URL || 'http://localhost:8080';
-const ANALYTICS_URL = (import.meta as any).env?.VITE_ANALYTICS_URL || 'http://localhost:8000';
+const normalizeUrl = (raw?: string, fallback = ''): string => {
+  const val = (raw || fallback).trim();
+  if (!val) return fallback;
+  if (val.startsWith('http://') || val.startsWith('https://')) return val;
+  return `https://${val}`;
+};
+
+const ORCHESTRATOR_URL = normalizeUrl((import.meta as any).env?.VITE_ORCHESTRATOR_URL, 'http://localhost:8080');
+const ANALYTICS_URL = normalizeUrl((import.meta as any).env?.VITE_ANALYTICS_URL, 'http://localhost:8000');
 
 interface ExperimentSummary {
   id: string;
