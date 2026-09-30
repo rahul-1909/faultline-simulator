@@ -2,7 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { 
   Activity, AlertCircle, AlertTriangle, CheckCircle2, ChevronRight, 
   Flame, Gauge, Info, Layers, Play, RefreshCw, RotateCcw, Server, 
-  ShieldAlert, ShieldCheck, Terminal, Trophy, Zap, Sliders, HelpCircle,
+  ShieldAlert, ShieldCheck, Terminal, Trophy, GitCompare, Sliders, HelpCircle,
   Hash, ArrowUpRight, XCircle
 } from 'lucide-react';
 
@@ -737,7 +737,7 @@ export default function App() {
                     : 'bg-slate-800/60 text-slate-400 hover:text-white border border-white/5'
                 }`}
               >
-                ⚡ Network Partition Only
+                🌐 Network Partition Only
               </button>
 
               <button
@@ -950,7 +950,7 @@ export default function App() {
                   activeTab === 'comparison' ? 'bg-slate-800 text-sky-400 shadow' : 'text-slate-400 hover:text-slate-200'
                 }`}
               >
-                <Zap className="w-3.5 h-3.5" />
+                <GitCompare className="w-3.5 h-3.5" />
                 <span>A/B Strategy Battle</span>
               </button>
             </div>
@@ -1398,7 +1398,7 @@ export default function App() {
               ) : (
                 <div className="bg-[#070b14] border border-white/5 rounded-xl p-10 flex flex-col items-center justify-center text-center gap-3">
                   <div className="w-12 h-12 rounded-xl bg-slate-800/60 flex items-center justify-center text-sky-400">
-                    <Zap className="w-6 h-6" />
+                    <GitCompare className="w-6 h-6" />
                   </div>
                   <h4 className="text-sm font-bold text-white">No Comparison Run Executed Yet</h4>
                   <p className="text-xs text-slate-400 max-w-md">
