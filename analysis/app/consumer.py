@@ -23,6 +23,13 @@ ORCHESTRATOR_URL = os.getenv("ORCHESTRATOR_URL", "http://localhost:8080")
 ANALYTICS_URL = os.getenv("ANALYTICS_URL", "http://localhost:8000")
 FALLBACK_STREAM_FILE = os.path.join(os.path.dirname(__file__), "..", "..", "orchestrator", "event_stream.jsonl")
 
+HEARTBEAT_FILE = os.getenv("HEARTBEAT_FILE", "/tmp/consumer_heartbeat")
+RUNNING = True
+
+def _handle_signal(signum, frame):
+    global RUNNING
+    RUNNING = False
+
 def validate_event_schema(event: Any) -> bool:
     """Validates the standard Faultline SimulationLifecycleEvent schema."""
     if not isinstance(event, dict):
@@ -71,29 +78,41 @@ def process_event(event: Dict[str, Any], processed_ids: Set[str]) -> bool:
     return False
 
 def start_consumer(poll_interval: float = 1.0, max_iterations: Optional[int] = None):
+    import signal
+    try:
+        signal.signal(signal.SIGINT, _handle_signal)
+        signal.signal(signal.SIGTERM, _handle_signal)
+    except (ValueError, AttributeError):
+        pass
+
     processed_events: Set[str] = set()
-    print(f"[EVENT CONSUMER] Starting Kafka consumer (Broker: {KAFKA_BROKER}, Topic: {KAFKA_TOPIC})...")
+    print(f"[EVENT CONSUMER] Starting Kafka consumer (Broker: {KAFKA_BROKER}, Topic: {KAFKA_TOPIC}, Group: {KAFKA_GROUP_ID})...")
 
     consumer = None
-    if KAFKA_AVAILABLE:
-        try:
-            consumer = KafkaConsumer(
-                KAFKA_TOPIC,
-                bootstrap_servers=[KAFKA_BROKER],
-                group_id=KAFKA_GROUP_ID,
-                value_deserializer=lambda m: json.loads(m.decode("utf-8")),
-                auto_offset_reset="earliest",
-                consumer_timeout_ms=1000,
-                enable_auto_commit=True
-            )
-            print(f"[EVENT CONSUMER] Successfully connected to Kafka/Redpanda broker: {KAFKA_BROKER}")
-        except Exception as e:
-            print(f"[EVENT CONSUMER NOTICE] Kafka broker at {KAFKA_BROKER} not reachable ({e}). Falling back to local event stream.")
-            consumer = None
-
     iterations = 0
-    while max_iterations is None or iterations < max_iterations:
+    last_reconnect_attempt = 0.0
+
+    while RUNNING and (max_iterations is None or iterations < max_iterations):
         iterations += 1
+
+        # Attempt connection/reconnection to Kafka broker
+        if consumer is None and KAFKA_AVAILABLE and (time.time() - last_reconnect_attempt > 5.0):
+            last_reconnect_attempt = time.time()
+            try:
+                consumer = KafkaConsumer(
+                    KAFKA_TOPIC,
+                    bootstrap_servers=[KAFKA_BROKER],
+                    group_id=KAFKA_GROUP_ID,
+                    value_deserializer=lambda m: json.loads(m.decode("utf-8")),
+                    auto_offset_reset="earliest",
+                    consumer_timeout_ms=1000,
+                    request_timeout_ms=1000,
+                    enable_auto_commit=True
+                )
+                print(f"[EVENT CONSUMER] Successfully connected to Kafka/Redpanda broker: {KAFKA_BROKER}")
+            except Exception as e:
+                # Log once or on failure
+                consumer = None
 
         # 1. Consume from Kafka broker if connected
         if consumer is not None:
@@ -103,6 +122,7 @@ def start_consumer(poll_interval: float = 1.0, max_iterations: Optional[int] = N
                     process_event(event, processed_events)
             except Exception as e:
                 print(f"[EVENT CONSUMER] Kafka consume error: {e}")
+                consumer = None
 
         # 2. Check local fallback event stream file (for offline/standalone execution)
         if os.path.exists(FALLBACK_STREAM_FILE):
@@ -120,7 +140,21 @@ def start_consumer(poll_interval: float = 1.0, max_iterations: Optional[int] = N
             except Exception as e:
                 print(f"[EVENT CONSUMER ERROR] Reading fallback stream: {e}")
 
+        # Update heartbeat for container healthcheck
+        try:
+            with open(HEARTBEAT_FILE, "w") as hf:
+                hf.write(str(time.time()))
+        except Exception:
+            pass
+
         time.sleep(poll_interval)
+
+    if consumer is not None:
+        try:
+            consumer.close()
+        except Exception:
+            pass
+    print("[EVENT CONSUMER] Shutdown complete.")
 
 if __name__ == "__main__":
     start_consumer()

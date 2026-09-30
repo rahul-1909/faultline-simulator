@@ -4,7 +4,9 @@ import os
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from app.analytics import analyze_results, compare_experiments, validate_simulation_results
-from app.consumer import validate_event_schema
+from app.consumer import validate_event_schema, process_event, start_consumer
+from unittest.mock import patch, MagicMock
+import tempfile
 
 class TestAnalytics(unittest.TestCase):
     def setUp(self):
@@ -131,6 +133,113 @@ class TestAnalytics(unittest.TestCase):
         }
         self.assertFalse(validate_event_schema(invalid_evt))
         self.assertFalse(validate_event_schema("not a dict"))
+
+    @patch("requests.get")
+    def test_consumer_lifecycle_events(self, mock_get):
+        # Mock analytics endpoint for EXPERIMENT_COMPLETED
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {
+            "analysis": {
+                "reliability_index": 85.5,
+                "bottleneck_diagnosis": {"primary_failure_cause": "NODE_DOWN"}
+            }
+        }
+        mock_get.return_value = mock_response
+
+        processed = set()
+
+        # 1. EXPERIMENT_QUEUED
+        queued_evt = {
+            "event_id": "evt-q-1",
+            "event_type": "EXPERIMENT_QUEUED",
+            "experiment_id": "exp-test-1",
+            "timestamp": "2026-09-30T12:00:00Z"
+        }
+        self.assertTrue(process_event(queued_evt, processed))
+        self.assertIn("evt-q-1", processed)
+
+        # Duplicate deduplication
+        self.assertFalse(process_event(queued_evt, processed))
+
+        # 2. EXPERIMENT_STARTED
+        started_evt = {
+            "event_id": "evt-s-1",
+            "event_type": "EXPERIMENT_STARTED",
+            "experiment_id": "exp-test-1",
+            "timestamp": "2026-09-30T12:00:01Z"
+        }
+        self.assertTrue(process_event(started_evt, processed))
+
+        # 3. EXPERIMENT_COMPLETED
+        completed_evt = {
+            "event_id": "evt-c-1",
+            "event_type": "EXPERIMENT_COMPLETED",
+            "experiment_id": "exp-test-1",
+            "timestamp": "2026-09-30T12:00:10Z"
+        }
+        self.assertTrue(process_event(completed_evt, processed))
+        mock_get.assert_called_once()
+
+        # 4. EXPERIMENT_FAILED
+        failed_evt = {
+            "event_id": "evt-f-1",
+            "event_type": "EXPERIMENT_FAILED",
+            "experiment_id": "exp-test-2",
+            "timestamp": "2026-09-30T12:00:05Z",
+            "payload": {"error": "process exited with code 1"}
+        }
+        self.assertTrue(process_event(failed_evt, processed))
+
+        # 5. EXPERIMENT_CANCELLED
+        cancelled_evt = {
+            "event_id": "evt-cn-1",
+            "event_type": "EXPERIMENT_CANCELLED",
+            "experiment_id": "exp-test-3",
+            "timestamp": "2026-09-30T12:00:02Z",
+            "payload": {"reason": "operator cancelled"}
+        }
+        self.assertTrue(process_event(cancelled_evt, processed))
+
+    @patch("app.consumer.FALLBACK_STREAM_FILE")
+    @patch("app.consumer.HEARTBEAT_FILE")
+    def test_consumer_fallback_stream_integration(self, mock_heartbeat, mock_stream):
+        with tempfile.NamedTemporaryFile(mode="w+", delete=False) as sf, \
+             tempfile.NamedTemporaryFile(mode="w+", delete=False) as hf:
+            stream_path = sf.name
+            heartbeat_path = hf.name
+
+            mock_stream.__str__ = lambda x: stream_path
+            mock_heartbeat.__str__ = lambda x: heartbeat_path
+
+            import json
+            sample_evt = {
+                "event_id": "evt-integ-1",
+                "event_type": "EXPERIMENT_STARTED",
+                "experiment_id": "exp-integ-1",
+                "timestamp": "2026-09-30T12:00:00Z"
+            }
+            sf.write(json.dumps(sample_evt) + "\n")
+            sf.flush()
+
+            # Run 1 iteration of consumer
+            with patch("app.consumer.FALLBACK_STREAM_FILE", stream_path), \
+                 patch("app.consumer.HEARTBEAT_FILE", heartbeat_path), \
+                 patch("app.consumer.KAFKA_AVAILABLE", False):
+                start_consumer(poll_interval=0.01, max_iterations=1)
+
+            # Check heartbeat file was updated
+            with open(heartbeat_path, "r") as f:
+                content = f.read().strip()
+                self.assertTrue(len(content) > 0)
+                self.assertGreater(float(content), 0.0)
+
+        # Cleanup
+        try:
+            os.remove(stream_path)
+            os.remove(heartbeat_path)
+        except OSError:
+            pass
 
 if __name__ == "__main__":
     unittest.main()

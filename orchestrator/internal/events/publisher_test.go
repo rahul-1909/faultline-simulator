@@ -7,22 +7,54 @@ import (
 	"time"
 )
 
-func TestKafkaPublisherSerializationAndOfflineFallback(t *testing.T) {
+func TestKafkaPublisherAllLifecycleEventsAndOfflineFallback(t *testing.T) {
 	// Point to unreachable test port to verify offline graceful fallback without crashing
 	pub := NewKafkaPublisher("127.0.0.1:59999", "test.topic")
 	defer pub.Close()
 
-	evt := SimulationLifecycleEvent{
-		EventID:      "evt-test-1",
-		EventType:    EventExperimentStarted,
-		ExperimentID: "exp-12345",
-		Timestamp:    time.Now().UTC(),
-		Payload:      map[string]interface{}{"status": "RUNNING"},
+	testEvents := []SimulationLifecycleEvent{
+		{
+			EventID:      "evt-test-queued",
+			EventType:    EventExperimentQueued,
+			ExperimentID: "exp-lifecycle-1",
+			Timestamp:    time.Now().UTC(),
+			Payload:      map[string]interface{}{"scenario": "basic_flow"},
+		},
+		{
+			EventID:      "evt-test-started",
+			EventType:    EventExperimentStarted,
+			ExperimentID: "exp-lifecycle-1",
+			Timestamp:    time.Now().UTC(),
+			Payload:      map[string]interface{}{"status": "RUNNING"},
+		},
+		{
+			EventID:      "evt-test-completed",
+			EventType:    EventExperimentCompleted,
+			ExperimentID: "exp-lifecycle-1",
+			Timestamp:    time.Now().UTC(),
+			Payload:      map[string]interface{}{"availability": 98.5},
+		},
+		{
+			EventID:      "evt-test-failed",
+			EventType:    EventExperimentFailed,
+			ExperimentID: "exp-lifecycle-2",
+			Timestamp:    time.Now().UTC(),
+			Payload:      map[string]interface{}{"error": "simulation timeout"},
+		},
+		{
+			EventID:      "evt-test-cancelled",
+			EventType:    EventExperimentCancelled,
+			ExperimentID: "exp-lifecycle-3",
+			Timestamp:    time.Now().UTC(),
+			Payload:      map[string]interface{}{"reason": "operator cancelled"},
+		},
 	}
 
-	err := pub.Publish(evt)
-	if err != nil {
-		t.Fatalf("Expected publish to succeed with local buffering, got error: %v", err)
+	for _, evt := range testEvents {
+		err := pub.Publish(evt)
+		if err != nil {
+			t.Fatalf("Expected publish to succeed with local buffering, got error: %v", err)
+		}
 	}
 
 	// Verify local event_stream.jsonl was appended
@@ -32,26 +64,28 @@ func TestKafkaPublisherSerializationAndOfflineFallback(t *testing.T) {
 	}
 	defer os.Remove("event_stream.jsonl")
 
-	var parsed SimulationLifecycleEvent
-	lines := json.NewDecoder(os.NewFile(0, "dummy"))
-	_ = lines
-	if len(data) == 0 {
-		t.Errorf("Expected event_stream.jsonl to contain data, got empty")
+	lines := splitLines(data)
+	if len(lines) < len(testEvents) {
+		t.Fatalf("Expected at least %d lines in event_stream.jsonl, got %d", len(testEvents), len(lines))
 	}
 
-	// Verify JSON unmarshals back to struct
-	if err := json.Unmarshal([]byte(data), &parsed); err != nil {
-		// Could have multiple lines if runs happened before; find last line
-		lines := splitLines(data)
-		if len(lines) > 0 {
-			if err2 := json.Unmarshal(lines[len(lines)-1], &parsed); err2 != nil {
-				t.Fatalf("Failed to parse event JSON: %v", err2)
-			}
+	// Verify the last 5 events correspond to our test events
+	tailLines := lines[len(lines)-len(testEvents):]
+	for i, lineBytes := range tailLines {
+		var parsed SimulationLifecycleEvent
+		if err := json.Unmarshal(lineBytes, &parsed); err != nil {
+			t.Fatalf("Failed to parse event JSON at index %d: %v", i, err)
 		}
-	}
-
-	if parsed.ExperimentID != "exp-12345" && parsed.EventID != "evt-test-1" {
-		t.Errorf("Mismatch in event fields: %+v", parsed)
+		expected := testEvents[i]
+		if parsed.EventID != expected.EventID {
+			t.Errorf("Index %d: Expected EventID %s, got %s", i, expected.EventID, parsed.EventID)
+		}
+		if parsed.EventType != expected.EventType {
+			t.Errorf("Index %d: Expected EventType %s, got %s", i, expected.EventType, parsed.EventType)
+		}
+		if parsed.ExperimentID != expected.ExperimentID {
+			t.Errorf("Index %d: Expected ExperimentID %s, got %s", i, expected.ExperimentID, parsed.ExperimentID)
+		}
 	}
 }
 

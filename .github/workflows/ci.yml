@@ -64,3 +64,17 @@ jobs:
       - name: TypeScript Check & Production Build
         working-directory: dashboard
         run: npm run build
+
+  docker-compose-test:
+    name: Docker Compose Build & Config Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate Compose Config
+        run: |
+          cd deploy
+          docker compose config
+      - name: Build Stack Images
+        run: |
+          cd deploy
+          docker compose build

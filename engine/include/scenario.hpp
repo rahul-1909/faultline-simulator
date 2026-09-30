@@ -444,16 +444,17 @@ namespace faultline
             }
 
             // 4. Setup Chaos Fault Events
-            if (scenario_json_.contains("chaos"))
+            const std::string chaos_key = scenario_json_.contains("chaos") ? "chaos" : (scenario_json_.contains("events") ? "events" : "");
+            if (!chaos_key.empty() && scenario_json_[chaos_key].is_array())
             {
-                for (const auto &c : scenario_json_["chaos"])
+                for (const auto &c : scenario_json_[chaos_key])
                 {
                     SimTime fault_time_us = MS_TO_US(c.value("time_ms", 0ULL));
                     SimTime duration_us = MS_TO_US(c.value("duration_ms", 500ULL));
                     std::string type = c.value("type", "");
                     std::string target = c.value("target", "");
 
-                    if (type == "NODE_CRASH" && nodes_.count(target))
+                    if ((type == "NODE_CRASH" || type == "CRASH_NODE") && nodes_.count(target))
                     {
                         // Inject crash
                         scheduler_.schedule_at(fault_time_us, EventType::NODE_CRASH, target, nullptr, [this, target]()
@@ -466,7 +467,7 @@ namespace faultline
                         std::cout << "[RECOVERY] Node recovered: " << target << "\n";
                         this->nodes_[target]->recover(); });
                     }
-                    else if (type == "NETWORK_PARTITION" && links_.count(target))
+                    else if ((type == "NETWORK_PARTITION" || type == "PARTITION_LINK") && links_.count(target))
                     {
                         // Cut link
                         scheduler_.schedule_at(fault_time_us, EventType::LINK_DEGRADE, target, nullptr, [this, target]()

@@ -4,7 +4,7 @@
 
 [![CI](https://github.com/rahul-1909/faultline-simulator/actions/workflows/ci.yml/badge.svg)](https://github.com/rahul-1909/faultline-simulator/actions/workflows/ci.yml)
 [![C++17](https://img.shields.io/badge/C%2B%2B-17-blue.svg)](https://isocpp.org/)
-[![Go](https://img.shields.io/badge/Go-1.22-00ADD8.svg)](https://golang.org/)
+[![Go](https://img.shields.io/badge/Go-1.23-00ADD8.svg)](https://golang.org/)
 [![Python](https://img.shields.io/badge/Python-3.12-3776AB.svg)](https://python.org/)
 [![React](https://img.shields.io/badge/React-18-61DAFB.svg)](https://react.dev/)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
@@ -13,21 +13,21 @@
 
 ## 1. Problem Statement
 
-Modern microservice architectures at hyperscalers (such as Netflix, Amazon, Uber, and Google) are subject to complex failure modes:
-- **Cascading Failures**: When one downstream dependency degrades, backpressure propagates upstream until edge gateways fail.
-- **Retry Storms & Stampedes**: Naive fixed-interval or immediate retries amplify load on recovering services, turning transient hiccups into permanent outages.
-- **Network Partitions & Split-Brain**: Network partitions drop or delay in-flight traffic, causing queue overflow and resource starvation.
-- **Queue Saturation & Tail Latency Explosions**: High concurrency under degraded worker capacity pushes latency percentiles (p95, p99) into timeout thresholds.
+Modern microservice architectures at hyperscalers (such as Netflix, Amazon, Uber, and Google) are subject to complex cascading failure modes:
+- **Cascading Failures**: When downstream dependencies degrade, bounded queues saturate and backpressure propagates upstream until edge gateways fail.
+- **Retry Storms & Stampedes**: Naive retries amplify traffic on recovering services, turning transient blips into persistent outages.
+- **Network Partitions & Link Degradation**: Severed links drop in-flight packets, stranding upstream callers and triggering queue timeouts.
+- **Tail Latency Explosions**: Concurrency bottlenecks push $p_{95}$ and $p_{99}$ latency past timeout thresholds.
 
-Testing these pathologies in physical staging environments or via real-time emulation is slow, expensive, nondeterministic, and hard to reproduce.
+Testing these failure scenarios in physical staging environments or via wall-clock emulation is slow, expensive, and non-deterministic.
 
-**Faultline** is a high-performance, deterministic discrete-event simulation engine designed to model distributed systems under stress. By maintaining a virtual clock priority queue and seed-controlled pseudo-randomness, Faultline simulates complex multi-node network traffic, bounded queue dynamics, worker concurrency, and chaos injections in milliseconds—producing 100% reproducible results for resilience benchmarking and A/B mitigation comparison.
+**Faultline** is a high-performance, deterministic discrete-event simulation (DES) platform for modeling distributed systems under stress. By maintaining a virtual clock priority queue and seed-controlled pseudo-randomness, Faultline simulates complex multi-hop network topologies, bounded FIFO queues, worker concurrency, and chaos injections in milliseconds—producing 100% reproducible results for resilience benchmarking, bottleneck diagnosis, and A/B mitigation comparison.
 
 ---
 
 ## 2. Architecture Overview
 
-Faultline is composed of four decoupled subsystems coordinated across event streaming and observability layers:
+Faultline consists of decoupled subsystems coordinated across event streaming, analytics, and observability layers:
 
 ```mermaid
 flowchart TD
@@ -35,6 +35,7 @@ flowchart TD
         Dashboard["React / TypeScript Dashboard (Port 3000)"]
         Prometheus["Prometheus Metrics (Port 9090)"]
         Grafana["Grafana Dashboards (Port 3001)"]
+        Console["Redpanda Console (Port 8085)"]
     end
 
     subgraph Orchestration ["Control Plane"]
@@ -47,23 +48,26 @@ flowchart TD
     end
 
     subgraph Streaming ["Event Streaming"]
-        Redpanda["Redpanda / Kafka Event Broker (Port 9092)"]
+        Redpanda["Redpanda / Kafka Broker (Port 9092, 29092)"]
     end
 
     subgraph Analytics ["Analytics Plane"]
-        PyAnalytics["Python FastAPI Statistical Service (Port 8000)"]
+        PyAnalytics["Python FastAPI Analytics Service (Port 8000)"]
+        PyConsumer["Kafka Consumer Worker (consumer.py)"]
     end
 
     Dashboard -->|"1. Submit Scenario JSON"| GoOrch
-    GoOrch -->|"2. Spawn & Monitor Process"| CPPEngine
-    CPPEngine -->|"3. Output JSON Metrics & Traces"| Runs
-    GoOrch -->|"4. Stream Run Lifecycle Events"| Redpanda
-    Dashboard -->|"5. Request Diagnostics & A/B Benchmark"| PyAnalytics
-    PyAnalytics -->|"6. Query Experiment Results"| GoOrch
-    Prometheus -->|"Scrape Metrics"| GoOrch
-    Prometheus -->|"Scrape Metrics"| PyAnalytics
-    Grafana -->|"Visualize"| Prometheus
-    Dashboard -->|"Render Topology & Diagnostics"| Dashboard
+    GoOrch -->|"2. Spawn & Supervise Process"| CPPEngine
+    CPPEngine -->|"3. Output Metrics & Event Traces"| Runs
+    GoOrch -->|"4. Publish Lifecycle Events (segmentio/kafka-go)"| Redpanda
+    Redpanda -->|"5. Stream Events (faultline.experiments)"| PyConsumer
+    PyConsumer -->|"6. Trigger Statistical Diagnostics"| PyAnalytics
+    Dashboard -->|"7. Query Experiment & A/B Comparison"| PyAnalytics
+    PyAnalytics -->|"8. Read Simulation Results"| GoOrch
+    Prometheus -->|"Scrape /metrics"| GoOrch
+    Prometheus -->|"Scrape /metrics"| PyAnalytics
+    Grafana -->|"Visualize Metrics"| Prometheus
+    Console -->|"Inspect Event Topics"| Redpanda
 ```
 
 ---
@@ -96,61 +100,33 @@ Faultline models a multi-tier microservice architecture handling e-commerce orde
 └──────────────┘
 ```
 
-### Route Lifecycle Execution:
-1. **Edge Dispatch**: Requests arrive according to a constant or Poisson-distributed rate.
-2. **Worker Scheduling**: Upon arriving at a node, the request enters the bounded FIFO queue if workers are busy. If the queue is saturated, it is dropped immediately (`QUEUE_FULL`).
-3. **Multi-Hop Sequential Processing**: A request completes execution at node `N` before transmitting across link `L` to node `N+1`. Network latency, queue waiting time, and service processing times are accumulated into end-to-end latency.
+### Request Flow & State Transitions:
+1. **Edge Dispatch**: Requests arrive according to constant or Poisson distributions.
+2. **Worker Scheduling & Queueing**: Arriving requests enter worker slots. If workers are saturated, requests enter a bounded FIFO queue. If the queue is full, the request is dropped immediately (`QUEUE_FULL`).
+3. **Multi-Hop Sequential Processing**: A request completes execution at node $N$ before transmitting across network link $L$ to node $N+1$. Queueing delay, worker service time, and network latency are accumulated into total end-to-end latency.
 4. **Terminal States**: Every request reaches an unambiguous terminal state: `SUCCEEDED` only upon completion of the final service hop, or `FAILED` if dropped due to node crash (`NODE_DOWN`), queue saturation (`QUEUE_FULL`), network partition (`NETWORK_PARTITION`), packet loss (`PACKET_LOSS`), or retry exhaustion (`RETRY_EXHAUSTED`).
 
 ---
 
 ## 4. Discrete-Event Simulation Mechanics
 
-Unlike real-time emulation (which must wait seconds or minutes of real wall-clock time), Faultline runs on a **Discrete-Event Simulation (DES)** model:
+Unlike real-time emulation, Faultline runs on a **Discrete-Event Simulation (DES)** engine:
 - **Priority Queue Scheduler**: Events are sorted strictly by `(timestamp, priority, sequence_id)`. Time advances instantaneously to the next scheduled event.
 - **Epoch Generation Guarding**: Nodes track a monotonic generation epoch. When a service crashes and restarts, stale worker completion events from prior epochs are invalidated, preventing worker underflow or phantom completions.
 - **Deterministic Seeded PRNG**: All jitter, retry delays, and probabilistic network packet losses use a standard 64-bit Mersenne Twister (`std::mt19937_64`) initialized with a user-specified seed. Running the same scenario with the same seed produces identical results down to the microsecond.
+- **Route Link Validation**: Every consecutive hop in a workload route is strictly verified against defined network links. Scenarios with missing hops are rejected upfront.
 
 ---
 
-## 5. Failure Modes Catalog
+## 5. Supported Fault Events Catalog
 
-| Fault Type | Scenario Trigger | Description & Engine Behavior |
-| :--- | :--- | :--- |
-| **Node Crash** | `"type": "CRASH_NODE"` | Transitions node to `OFFLINE`. Aborts processing workers and flushes queued requests as `NODE_DOWN`. |
-| **Node Recovery** | `"type": "RECOVER_NODE"` | Transitions node to `ONLINE`. Advances generation epoch; ready to receive new requests. |
-| **Network Partition** | `"type": "PARTITION_LINK"` | Flags network link as severed. In-transit and subsequent requests are dropped as `NETWORK_PARTITION`. |
-| **Link Heal** | `"type": "HEAL_LINK"` | Restores link connectivity to normal latency and zero drop rate. |
-| **Queue Overflow** | Implicit under load | When request arrival rate exceeds node service capacity `(workers / latency)`, queue saturates and drops with `QUEUE_FULL`. |
-| **Retry Storm** | Workload + Fault | Bounded retries with exponential backoff and jitter re-inject requests into the gateway upon failure until `max_retries` is reached. |
-
-### Example Fault Injection Syntax:
-```json
-{
-  "events": [
-    {
-      "time_ms": 500.0,
-      "type": "CRASH_NODE",
-      "target": "payment-service"
-    },
-    {
-      "time_ms": 1500.0,
-      "type": "RECOVER_NODE",
-      "target": "payment-service"
-    },
-    {
-      "time_ms": 800.0,
-      "type": "PARTITION_LINK",
-      "target": "order->payment"
-    },
-    {
-      "time_ms": 1800.0,
-      "type": "HEAL_LINK",
-      "target": "order->payment"
-    }
-  ]
-}
-```
+| Fault Type | Scenario Canonical Name | Scenario Aliases | Description & Engine Behavior |
+| :--- | :--- | :--- | :--- |
+| **Node Crash** | `NODE_CRASH` | `CRASH_NODE` | Transitions node to `OFFLINE`. Aborts processing workers and flushes queued requests as `NODE_DOWN`. Automatically recovers after `duration_ms`. |
+| **Network Partition** | `NETWORK_PARTITION` | `PARTITION_LINK` | Flags network link as severed. In-transit and subsequent packets are dropped as `NETWORK_PARTITION`. Automatically heals after `duration_ms`. |
+| **Packet Loss** | Configured via `drop_rate` | `loss_rate` | Probabilistically drops packets crossing the link based on PRNG seeded draw (`PACKET_LOSS`). |
+| **Queue Overflow** | Implicit under load | N/A | Saturated FIFO queues reject new arrivals immediately (`QUEUE_FULL`). |
+| **Retry Storm** | Workload + Faults | N/A | Retries with exponential backoff and jitter re-inject requests into the gateway upon failure until `max_retries` is reached. |
 
 ---
 
@@ -158,74 +134,180 @@ Unlike real-time emulation (which must wait seconds or minutes of real wall-cloc
 
 - **Availability Rate (%)**:
   $$\text{Availability} = \left(\frac{\text{Successful Requests}}{\text{Total Injected Requests}}\right) \times 100$$
-- **Latency Percentiles**: Latencies of all `SUCCEEDED` requests are recorded and sorted to compute exact $p_{50}$, $p_{90}$, $p_{95}$, and $p_{99}$ metrics.
+- **Nearest-Rank Latency Percentiles**:
+  Computed using standard nearest-rank indexing:
+  $$\text{Index} = \lceil p \times N \rceil - 1$$
+  Guaranteeing strict monotonicity ($p_{50} \le p_{95} \le p_{99} \le \text{max}$).
 - **System Reliability Index (SRI)**:
   $$\text{SRI} = 0.70 \times \text{Availability} + 0.30 \times \text{Latency Compliance Score}$$
   Where Latency Compliance scores $100$ when $p_{95} \le 50\text{ ms}$, decaying linearly for higher tail latency.
-- **Bottleneck Identification**: The analytics engine ranks services by cumulative drop rate and peak queue saturation to pinpoint the primary failure bottleneck.
-- **A/B Strategy Comparison**: Evaluates baseline resilience vs. mitigation strategies (e.g., Naive Retry vs Exponential Backoff + Jitter) under identical fault conditions and workloads.
+- **Bottleneck Diagnosis**: Ranks nodes by drop count and peak queue saturation to pinpoint the primary failure bottleneck.
+- **A/B Comparison Modes**:
+  1. `controlled_retry`: Evaluates identical topology and workload varying only the retry policy.
+  2. `architecture_comparison`: Evaluates architectural differences (worker concurrency, queue capacity, network topology).
+  - **Latency Delta Sign Convention**: Negative delta ($-\Delta$ ms) indicates improved/faster performance; positive delta ($+\Delta$ ms) indicates regression.
 
 ---
 
-## 7. Tech Stack
+## 7. Scenario JSON Schema
 
-| Component | Language / Framework | Description |
-| :--- | :--- | :--- |
-| **Simulation Core** | C++17, STL | High-speed discrete-event simulator with microsecond precision |
-| **Orchestrator** | Go 1.22, Net/HTTP | Concurrency controller, process supervisor, and Prometheus exporter |
-| **Analytics Engine** | Python 3.12, FastAPI, NumPy | Statistical modeling, SRI calculation, and A/B benchmarking |
-| **Dashboard** | React 18, TypeScript, Tailwind CSS, Lucide | Real-time interactive UI, topology visualization, and metrics charts |
-| **Event Broker** | Redpanda (Kafka v23.3) | High-throughput distributed event streaming for simulation logs |
-| **Observability** | Prometheus & Grafana | Time-series metrics scraping and dashboard visualization |
-| **Containerization** | Docker, Docker Compose | Multi-stage production container builds |
+Scenarios support both canonical keys and backward-compatible aliases:
+
+```json
+{
+  "name": "Payment Service Cascading Outage",
+  "seed": 42,
+  "duration_ms": 3000,
+  "workload": {
+    "requests_per_second": 120.0,
+    "duration_ms": 3000,
+    "route": [
+      "api-gateway",
+      "order-service",
+      "payment-service",
+      "inventory-service"
+    ],
+    "retry_policy": {
+      "max_retries": 3,
+      "backoff_ms": 25,
+      "backoff_multiplier": 1.5,
+      "jitter_ms": 5
+    }
+  },
+  "nodes": [
+    {
+      "id": "api-gateway",
+      "concurrency": 8,
+      "service_time_ms": 5,
+      "queue_capacity": 100
+    },
+    {
+      "id": "order-service",
+      "concurrency": 4,
+      "service_time_ms": 15,
+      "queue_capacity": 50
+    },
+    {
+      "id": "payment-service",
+      "concurrency": 2,
+      "service_time_ms": 45,
+      "queue_capacity": 20
+    },
+    {
+      "id": "inventory-service",
+      "concurrency": 4,
+      "service_time_ms": 10,
+      "queue_capacity": 50
+    }
+  ],
+  "links": [
+    {
+      "id": "gw->order",
+      "source": "api-gateway",
+      "target": "order-service",
+      "latency_ms": 2,
+      "jitter_ms": 1,
+      "drop_rate": 0.0
+    },
+    {
+      "id": "order->payment",
+      "source": "order-service",
+      "target": "payment-service",
+      "latency_ms": 5,
+      "jitter_ms": 2,
+      "drop_rate": 0.0
+    },
+    {
+      "id": "payment->inventory",
+      "source": "payment-service",
+      "target": "inventory-service",
+      "latency_ms": 3,
+      "jitter_ms": 1,
+      "drop_rate": 0.0
+    }
+  ],
+  "chaos": [
+    {
+      "time_ms": 500,
+      "duration_ms": 1000,
+      "type": "NODE_CRASH",
+      "target": "payment-service"
+    }
+  ]
+}
+```
+
+### Supported Schema Aliases:
+- `workload.requests_per_second` $\leftrightarrow$ `workload.arrival_rate_rps`
+- `nodes[].concurrency` $\leftrightarrow$ `nodes[].workers`
+- `nodes[].service_time_ms` $\leftrightarrow$ `nodes[].processing_time_ms`
+- `links[].drop_rate` $\leftrightarrow$ `links[].loss_rate`
+- `chaos` $\leftrightarrow$ `events`
 
 ---
 
-## 8. Quickstart with Docker Compose
+## 8. Deployment & Quickstart
 
-Deploy the entire Faultline suite with a single command:
+### Running with Docker Compose
+
+Deploy the complete multi-container stack with a single command:
 
 ```bash
 cd deploy
 docker compose up --build -d
 ```
 
-### Accessing Endpoints:
-- **Web Dashboard**: [http://localhost:3000](http://localhost:3000)
-- **Go Orchestrator API**: [http://localhost:8080](http://localhost:8080)
-- **FastAPI Analytics API**: [http://localhost:8000/docs](http://localhost:8000/docs)
-- **Redpanda Console**: [http://localhost:8085](http://localhost:8085)
-- **Prometheus Metrics**: [http://localhost:9090](http://localhost:9090)
-- **Grafana Dashboards**: [http://localhost:3001](http://localhost:3001) *(login: `admin` / `faultline`)*
+### Stack Components & Endpoints:
+
+| Service | Port | Description |
+| :--- | :--- | :--- |
+| **Web Dashboard** | `http://localhost:3000` | Interactive React + Tailwind UI |
+| **Go Orchestrator** | `http://localhost:8080` | REST API, lifecycle manager, Prometheus exporter |
+| **FastAPI Analytics** | `http://localhost:8000` | Statistical diagnostics, SRI, and A/B comparison API |
+| **Analytics Consumer** | Background Worker | Consumes `faultline.experiments` from Kafka/Redpanda |
+| **Redpanda Broker** | `localhost:9092` / `29092` | Kafka-compatible high-throughput event broker |
+| **Redpanda Console** | `http://localhost:8085` | Web-based topic & message inspector |
+| **Prometheus** | `http://localhost:9090` | Time-series metrics scraper |
+| **Grafana** | `http://localhost:3001` | Pre-provisioned dashboards (`admin` / `faultline`) |
+
+### Environment Configuration:
+- `KAFKA_BROKER`: Broker address (default `redpanda:29092` in Docker, `localhost:9092` locally).
+- `KAFKA_TOPIC`: Event stream topic name (default `faultline.experiments`).
+- `KAFKA_GROUP_ID`: Consumer group ID (default `faultline-analytics-group`).
+- `ORCHESTRATOR_URL`: Orchestrator base URL (default `http://localhost:8080`).
+- `ANALYTICS_URL`: Analytics base URL (default `http://localhost:8000`).
 
 ---
 
-## 9. Manual Build & Execution
+## 9. Manual Local Build & Execution
 
 ### Prerequisites:
 - C++17 compiler (`g++` or `clang++`)
-- Go 1.22+
-- Python 3.10+
+- Go 1.23+
+- Python 3.12+
 - Node.js 18+ and `npm`
 
 ### 1. Build C++ Simulation Engine
 ```bash
 cd engine
-g++ -std=c++17 -O3 -Wall -Wextra -pedantic -static -Iinclude src/main.cpp -o faultline_engine
+g++ -std=c++17 -O3 -Wall -Wextra -pedantic -static -Iinclude src/main.cpp -o faultline_engine.exe
 ```
 
 ### 2. Build & Run Go Orchestrator
 ```bash
 cd orchestrator
-go build -o faultline_orchestrator ./cmd/server
-./faultline_orchestrator
+go build -o faultline_orchestrator.exe ./cmd/server
+./faultline_orchestrator.exe
 ```
 
-### 3. Run Python Analytics Service
+### 3. Run Python Analytics Service & Consumer
 ```bash
 cd analysis
 pip install -r requirements.txt
+# Terminal 1: Analytics API
 uvicorn app.main:app --host 0.0.0.0 --port 8000
+# Terminal 2: Event Stream Consumer Worker
+python -m app.consumer
 ```
 
 ### 4. Run React Dashboard
@@ -237,186 +319,61 @@ npm run dev
 
 ---
 
-## 10. Scenario Configuration Guide
+## 10. Automated Testing Suites
 
-Simulation scenarios are defined as JSON documents:
-
-```json
-{
-  "name": "Payment Gateway Cascading Outage",
-  "seed": 42,
-  "duration_ms": 3000.0,
-  "workload": {
-    "arrival_rate_rps": 120.0,
-    "distribution": "CONSTANT",
-    "route": [
-      "api-gateway",
-      "order-service",
-      "payment-service",
-      "inventory-service"
-    ]
-  },
-  "retry_policy": {
-    "max_retries": 3,
-    "backoff_ms": 25.0
-  },
-  "nodes": [
-    {
-      "id": "api-gateway",
-      "workers": 8,
-      "processing_time_ms": 5.0,
-      "queue_capacity": 100
-    },
-    {
-      "id": "order-service",
-      "workers": 4,
-      "processing_time_ms": 15.0,
-      "queue_capacity": 50
-    },
-    {
-      "id": "payment-service",
-      "workers": 2,
-      "processing_time_ms": 45.0,
-      "queue_capacity": 20
-    },
-    {
-      "id": "inventory-service",
-      "workers": 4,
-      "processing_time_ms": 10.0,
-      "queue_capacity": 50
-    }
-  ],
-  "links": [
-    {
-      "id": "gw->order",
-      "source": "api-gateway",
-      "target": "order-service",
-      "latency_ms": 2.0,
-      "loss_rate": 0.0
-    },
-    {
-      "id": "order->payment",
-      "source": "order-service",
-      "target": "payment-service",
-      "latency_ms": 5.0,
-      "loss_rate": 0.0
-    },
-    {
-      "id": "payment->inventory",
-      "source": "payment-service",
-      "target": "inventory-service",
-      "latency_ms": 3.0,
-      "loss_rate": 0.0
-    }
-  ],
-  "events": [
-    {
-      "time_ms": 500.0,
-      "type": "CRASH_NODE",
-      "target": "payment-service"
-    },
-    {
-      "time_ms": 1800.0,
-      "type": "RECOVER_NODE",
-      "target": "payment-service"
-    }
-  ]
-}
-```
-
----
-
-## 11. Testing Guide
-
-### 1. C++ Engine Regression Suite (11 Tests)
-Validates virtual clock ordering, FIFO tie-breaking, queue overflow, link partitions, packet loss, multi-hop latency accumulation, request terminal states, crash generation epoch invalidation, crash queue eviction, scenario validation rules, and seed reproducibility:
+### 1. C++ Simulation Engine Regression Tests (14 Tests)
+Validates virtual clock scheduling, deterministic FIFO tie-breaking, queue backpressure, link partitions, packet loss, multi-hop sequential processing, explicit terminal states, epoch recovery invalidation, queue eviction, validation rules, deterministic reproducibility, route link connectivity, schema aliases, and nearest-rank percentiles:
 ```bash
-g++ -std=c++17 -Wall -Wextra -pedantic -Iengine/include engine/tests/test_engine.cpp -o engine/tests/test_engine
-./engine/tests/test_engine
+cd engine
+g++ -std=c++17 -Wall -Wextra -pedantic -static -Iinclude tests/test_engine.cpp -o tests/test_engine.exe
+./tests/test_engine.exe
 ```
-*Expected Result:*
-```
-[PASS] Scheduler Event Ordering
-[PASS] Equal Timestamp FIFO Tie-Breaking
-[PASS] Node Queue Overflow
-[PASS] Link Partition Packet Drop
-[PASS] Link Packet Loss Rate
-[PASS] Sequential Multi-Hop Latency Accumulation
-[PASS] Request Terminal State Tracking
-[PASS] Crash Event Invalidation & Recovery
-[PASS] Crash Queue Eviction
-[PASS] Scenario Validation Rules
-[PASS] Deterministic Seed Reproducibility
-All 11/11 tests PASSED successfully.
-```
+*Result: 14/14 PASSED.*
 
-### 2. Go Orchestrator Unit Tests (7 Tests)
-Validates experiment management, ID isolation, error handling, Prometheus metrics format, `/health` engine binary readiness check, and scenario JSON validation:
+### 2. Go Orchestrator Unit & Concurrency Tests (7 Tests with Race Detector)
+Validates pure-Go Kafka publisher with graceful offline fallback, `/healthz` engine readiness check, `/metrics` Prometheus exposition, scenario validation, `DELETE` and `/cancel` endpoints, queued job cancellation, and thread-safe concurrent access:
 ```bash
 cd orchestrator
-go test -v ./...
+go test -v -race ./...
 ```
-*Expected Result:*
-```
-=== RUN   TestHealthEndpoint
---- PASS: TestHealthEndpoint (0.00s)
-=== RUN   TestMetricsEndpoint
---- PASS: TestMetricsEndpoint (0.00s)
-=== RUN   TestExperimentsListEmpty
---- PASS: TestExperimentsListEmpty (0.00s)
-=== RUN   TestCreateExperimentValidation
---- PASS: TestCreateExperimentValidation (0.00s)
-=== RUN   TestGetNonExistentExperiment
---- PASS: TestGetNonExistentExperiment (0.00s)
-=== RUN   TestCreateAndListExperiments
---- PASS: TestCreateAndListExperiments (0.00s)
-=== RUN   TestCancelNonexistentExperiment
---- PASS: TestCancelNonexistentExperiment (0.00s)
-PASS
-```
+*Result: 7/7 PASSED with 0 data races.*
 
-### 3. Python Analytics Unit Tests (5 Tests)
-Validates diagnostics calculation, SRI scores, bottleneck detection, empty results handling, and A/B comparison logic:
+### 3. Python Analytics & Consumer Integration Tests (10 Tests)
+Validates statistical analysis, metric validation, count consistency, percentile monotonicity, `controlled_retry` and `architecture_comparison` modes, schema validation, consumer lifecycle events (`QUEUED`, `STARTED`, `COMPLETED`, `FAILED`, `CANCELLED`), and event stream ingestion:
 ```bash
-python -m unittest discover -s analysis/tests
+python -m unittest discover -s analysis/tests -v
 ```
-*Expected Result:*
-```
-Ran 5 tests in 0.000s
-OK
-```
+*Result: 10/10 PASSED.*
 
-### 4. React Frontend Validation
-Validates TypeScript static typing, component compilation, and bundle optimization:
+### 4. React Frontend Production Build
+Validates TypeScript static typing, component bundling, and CSS asset generation:
 ```bash
 cd dashboard
 npm run build
 ```
-*Expected Result:*
-```
-✓ built in ~10s with 0 errors
-```
+*Result: Clean production build with 0 TypeScript/Vite errors.*
 
 ---
 
-## 12. API Reference
+## 11. API Reference
 
 ### Go Orchestrator (`http://localhost:8080`)
-- `GET /health` — Returns service health and verifies C++ engine binary execution readiness.
-- `GET /metrics` — Prometheus metrics scraping endpoint.
-- `GET /api/v1/experiments` — Lists historical and active simulation experiments.
-- `POST /api/v1/experiments` — Submits a scenario for execution. Support `?wait=true` for synchronous execution.
+- `GET /health` — Returns status of orchestrator and checks whether the C++ engine binary can execute.
+- `GET /metrics` — Prometheus metrics scraping endpoint (`faultline_simulation_engine_ready`, active experiments, total runs).
+- `GET /api/v1/experiments` — Lists simulation experiments sorted chronologically.
+- `POST /api/v1/experiments` — Validates and submits a scenario. Add `?wait=true` for synchronous execution.
 - `GET /api/v1/experiments/{id}` — Retrieves experiment status, scenario, and output metrics.
-- `DELETE /api/v1/experiments/{id}` — Cancels an in-flight experiment.
+- `DELETE /api/v1/experiments/{id}` / `POST /api/v1/experiments/{id}/cancel` — Cancels an in-flight or queued experiment.
 
 ### Python Analytics Service (`http://localhost:8000`)
 - `GET /health` — Health check endpoint.
-- `POST /api/v1/analyze` — Analyzes raw simulation metrics, returning SRI and bottleneck diagnosis.
-- `POST /api/v1/compare` — Performs A/B comparative evaluation of two simulation runs.
-- `GET /api/v1/experiments/{id}/analysis` — Fetches experiment data directly from orchestrator and returns complete diagnostics.
+- `GET /metrics` — Prometheus metrics endpoint.
+- `POST /api/v1/analyze` — Computes SRI, failure cause ranking, and bottleneck diagnoses.
+- `POST /api/v1/compare` — Performs A/B comparison (`controlled_retry` or `architecture_comparison`).
+- `GET /api/v1/experiments/{id}/analysis` — Retrieves experiment data and computes full diagnostics.
 
 ---
 
-## 13. License
+## 12. License
 
-Distributed under the MIT License. See `LICENSE` for more information.
+Distributed under the MIT License. See `LICENSE` for details.

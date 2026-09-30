@@ -52,10 +52,15 @@ func main() {
 	if kafkaBroker == "" {
 		kafkaBroker = "localhost:9092"
 	}
-	publisher := events.NewKafkaPublisher(kafkaBroker, "faultline.experiments")
+	kafkaTopic := os.Getenv("KAFKA_TOPIC")
+	if kafkaTopic == "" {
+		kafkaTopic = "faultline.experiments"
+	}
+	publisher := events.NewKafkaPublisher(kafkaBroker, kafkaTopic)
 	defer publisher.Close()
 
 	fmt.Printf("Kafka Broker  : %s\n", kafkaBroker)
+	fmt.Printf("Kafka Topic   : %s\n", kafkaTopic)
 	fmt.Println("---------------------------------------------------------")
 
 	orch, err := service.NewOrchestrator(engineBin, runsDir, publisher)

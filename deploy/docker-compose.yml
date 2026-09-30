@@ -41,6 +41,30 @@ services:
       timeout: 5s
       retries: 3
 
+  # 2b. Kafka Analytics Consumer Worker
+  analytics-consumer:
+    build:
+      context: ..
+      dockerfile: analysis/Dockerfile
+    container_name: faultline-analytics-consumer
+    command: ["python", "-m", "app.consumer"]
+    environment:
+      - ORCHESTRATOR_URL=http://orchestrator:8080
+      - ANALYTICS_URL=http://analytics:8000
+      - KAFKA_BROKER=redpanda:29092
+      - KAFKA_TOPIC=faultline.experiments
+      - KAFKA_GROUP_ID=faultline-analytics-group
+      - HEARTBEAT_FILE=/tmp/consumer_heartbeat
+    depends_on:
+      - redpanda
+      - orchestrator
+      - analytics
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os, time; t=os.path.getmtime('/tmp/consumer_heartbeat'); assert time.time()-t < 30"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
   # 3. React + TypeScript Dashboard
   dashboard:
     build:
@@ -72,6 +96,11 @@ services:
     ports:
       - "9092:9092"
       - "9644:9644"
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -E 'Healthy:.+true' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
   # 5. Redpanda Console (Visual Kafka Topic Inspector)
   redpanda-console:
