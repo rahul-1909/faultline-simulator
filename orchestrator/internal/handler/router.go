@@ -4,6 +4,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/http/httputil"
+	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -12,11 +16,25 @@ import (
 )
 
 type APIHandler struct {
-	orch *service.Orchestrator
+	orch           *service.Orchestrator
+	analyticsProxy *httputil.ReverseProxy
+	staticDir      string
 }
 
 func NewAPIHandler(orch *service.Orchestrator) *APIHandler {
 	return &APIHandler{orch: orch}
+}
+
+func (h *APIHandler) SetAnalyticsURL(analyticsURL string) {
+	if analyticsURL != "" {
+		if target, err := url.Parse(analyticsURL); err == nil {
+			h.analyticsProxy = httputil.NewSingleHostReverseProxy(target)
+		}
+	}
+}
+
+func (h *APIHandler) SetStaticDir(dir string) {
+	h.staticDir = dir
 }
 
 func (h *APIHandler) RegisterRoutes(mux *http.ServeMux) {
@@ -24,6 +42,27 @@ func (h *APIHandler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/metrics", h.handleMetrics)
 	mux.HandleFunc("/api/v1/experiments", h.handleExperiments)
 	mux.HandleFunc("/api/v1/experiments/", h.handleExperimentByID)
+
+	if h.analyticsProxy != nil {
+		mux.Handle("/api/v1/analyze", h.analyticsProxy)
+		mux.Handle("/api/v1/compare", h.analyticsProxy)
+	}
+
+	if h.staticDir != "" {
+		mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+			if strings.HasPrefix(r.URL.Path, "/api/") || r.URL.Path == "/health" || r.URL.Path == "/metrics" {
+				http.NotFound(w, r)
+				return
+			}
+			cleanPath := filepath.Clean(strings.TrimPrefix(r.URL.Path, "/"))
+			targetFile := filepath.Join(h.staticDir, cleanPath)
+			if info, err := os.Stat(targetFile); err == nil && !info.IsDir() {
+				http.ServeFile(w, r, targetFile)
+				return
+			}
+			http.ServeFile(w, r, filepath.Join(h.staticDir, "index.html"))
+		})
+	}
 }
 
 func (h *APIHandler) handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -154,6 +193,14 @@ func (h *APIHandler) handleExperimentByID(w http.ResponseWriter, r *http.Request
 	if id == "" {
 		writeError(w, http.StatusBadRequest, "Missing experiment ID")
 		return
+	}
+
+	// Check for analysis sub-path: /api/v1/experiments/{id}/analysis
+	if strings.HasSuffix(id, "/analysis") {
+		if h.analyticsProxy != nil {
+			h.analyticsProxy.ServeHTTP(w, r)
+			return
+		}
 	}
 
 	// Check for cancel sub-path: /api/v1/experiments/{id}/cancel

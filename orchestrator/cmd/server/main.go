@@ -68,7 +68,19 @@ func main() {
 		log.Fatalf("Failed to initialize orchestrator: %v", err)
 	}
 
+	analyticsURL := os.Getenv("ANALYTICS_URL")
+	staticDir := os.Getenv("STATIC_DIR")
+
 	api := handler.NewAPIHandler(orch)
+	if analyticsURL != "" {
+		api.SetAnalyticsURL(analyticsURL)
+		fmt.Printf("Analytics Proxy: %s\n", analyticsURL)
+	}
+	if staticDir != "" {
+		api.SetStaticDir(staticDir)
+		fmt.Printf("Static UI Dir  : %s\n", staticDir)
+	}
+
 	mux := http.NewServeMux()
 	api.RegisterRoutes(mux)
 

@@ -6,15 +6,23 @@ import {
   Hash, ArrowUpRight, XCircle
 } from 'lucide-react';
 
-const normalizeUrl = (raw?: string, fallback = ''): string => {
-  const val = (raw || fallback).trim();
-  if (!val) return fallback;
-  if (val.startsWith('http://') || val.startsWith('https://')) return val;
-  return `https://${val}`;
+const getApiBaseUrl = (envVar: string | undefined, defaultLocal: string) => {
+  if (envVar !== undefined && envVar !== null) {
+    const trimmed = envVar.trim();
+    if (trimmed === '') return ''; // Same-domain relative path!
+    if (trimmed.startsWith('http://') || trimmed.startsWith('https://')) return trimmed;
+    return `https://${trimmed}`;
+  }
+  // When running locally under vite dev (port 3000), default to separate local backend ports
+  if (typeof window !== 'undefined' && (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1') && window.location.port === '3000') {
+    return defaultLocal;
+  }
+  // When running in unified production container, use same-origin relative URLs
+  return '';
 };
 
-const ORCHESTRATOR_URL = normalizeUrl((import.meta as any).env?.VITE_ORCHESTRATOR_URL, 'http://localhost:8080');
-const ANALYTICS_URL = normalizeUrl((import.meta as any).env?.VITE_ANALYTICS_URL, 'http://localhost:8000');
+const ORCHESTRATOR_URL = getApiBaseUrl((import.meta as any).env?.VITE_ORCHESTRATOR_URL, 'http://localhost:8080');
+const ANALYTICS_URL = getApiBaseUrl((import.meta as any).env?.VITE_ANALYTICS_URL, 'http://localhost:8000');
 
 interface ExperimentSummary {
   id: string;

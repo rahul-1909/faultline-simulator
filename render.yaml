@@ -1,55 +1,21 @@
 services:
-  # 1. Go Orchestrator (houses the C++ discrete-event simulation engine)
+  # Faultline: Unified Distributed Systems Failure Simulation Platform (All-in-One)
   - type: web
-    name: faultline-orchestrator
+    name: faultline
     runtime: docker
-    dockerfilePath: orchestrator/Dockerfile
+    dockerfilePath: Dockerfile
     dockerContext: .
     plan: free
     region: oregon
     healthCheckPath: /health
     envVars:
       - key: PORT
-        value: 8080
+        value: 10000
+      - key: STATIC_DIR
+        value: /app/dashboard/dist
+      - key: ANALYTICS_URL
+        value: http://127.0.0.1:8000
       - key: KAFKA_BROKER
         value: localhost:9092
       - key: KAFKA_TOPIC
         value: faultline.experiments
-
-  # 2. Python FastAPI Analytics Engine
-  - type: web
-    name: faultline-analytics
-    runtime: docker
-    dockerfilePath: analysis/Dockerfile
-    dockerContext: .
-    plan: free
-    region: oregon
-    healthCheckPath: /health
-    envVars:
-      - key: ORCHESTRATOR_URL
-        fromService:
-          type: web
-          name: faultline-orchestrator
-          property: host
-
-  # 3. React + TypeScript Interactive Dashboard (Static Site)
-  - type: web
-    name: faultline-dashboard
-    runtime: static
-    buildCommand: cd dashboard && npm install && npm run build
-    staticPublishPath: dashboard/dist
-    routes:
-      - type: rewrite
-        source: /*
-        destination: /index.html
-    envVars:
-      - key: VITE_ORCHESTRATOR_URL
-        fromService:
-          type: web
-          name: faultline-orchestrator
-          property: host
-      - key: VITE_ANALYTICS_URL
-        fromService:
-          type: web
-          name: faultline-analytics
-          property: host

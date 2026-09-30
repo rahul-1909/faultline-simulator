@@ -78,3 +78,6 @@ jobs:
         run: |
           cd deploy
           docker compose build
+      - name: Build Unified Production Image
+        run: |
+          docker build -t faultline-unified .
