@@ -1,0 +1,88 @@
+version: '3.8'
+
+services:
+  # 1. Go Orchestrator (houses C++ simulation core)
+  orchestrator:
+    build:
+      context: ..
+      dockerfile: orchestrator/Dockerfile
+    container_name: faultline-orchestrator
+    ports:
+      - "8080:8080"
+    environment:
+      - PORT=8080
+      - KAFKA_BROKER=redpanda:29092
+    depends_on:
+      - redpanda
+
+  # 2. Python FastAPI Analytics Engine
+  analytics:
+    build:
+      context: ..
+      dockerfile: analysis/Dockerfile
+    container_name: faultline-analytics
+    ports:
+      - "8000:8000"
+    environment:
+      - ORCHESTRATOR_URL=http://orchestrator:8080
+    depends_on:
+      - orchestrator
+
+  # 3. React + TypeScript Dashboard
+  dashboard:
+    build:
+      context: ..
+      dockerfile: dashboard/Dockerfile
+    container_name: faultline-dashboard
+    ports:
+      - "3000:80"
+    depends_on:
+      - orchestrator
+      - analytics
+
+  # 4. Redpanda (Kafka-compatible event streaming)
+  redpanda:
+    image: docker.redpanda.com/redpandadata/redpanda:v23.3.11
+    container_name: faultline-redpanda
+    command:
+      - redpanda start
+      - --smp 1
+      - --memory 512M
+      - --overprovisioned
+      - --kafka-addr PLAINTEXT://0.0.0.0:29092,OUTSIDE://0.0.0.0:9092
+      - --advertise-kafka-addr PLAINTEXT://redpanda:29092,OUTSIDE://localhost:9092
+    ports:
+      - "9092:9092"
+      - "9644:9644"
+
+  # 5. Redpanda Console (Visual Kafka Topic Inspector)
+  redpanda-console:
+    image: docker.redpanda.com/redpandadata/console:v2.4.3
+    container_name: faultline-redpanda-console
+    ports:
+      - "8085:8080"
+    environment:
+      KAFKA_BROKERS: redpanda:29092
+    depends_on:
+      - redpanda
+
+  # 6. Prometheus (Metrics Scraper)
+  prometheus:
+    image: prom/prometheus:v2.50.0
+    container_name: faultline-prometheus
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+    ports:
+      - "9090:9090"
+
+  # 7. Grafana (Observability Dashboard)
+  grafana:
+    image: grafana/grafana:10.3.3
+    container_name: faultline-grafana
+    ports:
+      - "3001:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=faultline
+    depends_on:
+      - prometheus

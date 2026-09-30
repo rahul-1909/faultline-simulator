@@ -1,0 +1,63 @@
+{
+  "name": "Cascading Retry Storm Outage",
+  "seed": 99,
+  "duration_ms": 1500,
+  "nodes": [
+    {
+      "id": "api-gateway",
+      "concurrency": 8,
+      "queue_capacity": 30,
+      "service_time_ms": 2
+    },
+    {
+      "id": "order-service",
+      "concurrency": 4,
+      "queue_capacity": 15,
+      "service_time_ms": 12
+    },
+    {
+      "id": "payment-service",
+      "concurrency": 2,
+      "queue_capacity": 8,
+      "service_time_ms": 30
+    }
+  ],
+  "links": [
+    {
+      "id": "link-gw-order",
+      "source": "api-gateway",
+      "target": "order-service",
+      "latency_ms": 8,
+      "jitter_ms": 2,
+      "drop_rate": 0.0
+    },
+    {
+      "id": "link-order-payment",
+      "source": "order-service",
+      "target": "payment-service",
+      "latency_ms": 15,
+      "jitter_ms": 4,
+      "drop_rate": 0.05
+    }
+  ],
+  "workload": {
+    "requests_per_second": 120,
+    "start_time_ms": 0,
+    "duration_ms": 1200,
+    "route": ["api-gateway", "order-service", "payment-service"]
+  },
+  "chaos": [
+    {
+      "time_ms": 200,
+      "type": "NODE_CRASH",
+      "target": "payment-service",
+      "duration_ms": 400
+    },
+    {
+      "time_ms": 700,
+      "type": "NETWORK_PARTITION",
+      "target": "link-order-payment",
+      "duration_ms": 300
+    }
+  ]
+}

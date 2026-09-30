@@ -1,0 +1,12 @@
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: 'faultline-orchestrator'
+    static_configs:
+      - targets: ['host.docker.internal:8080']
+
+  - job_name: 'faultline-analytics'
+    static_configs:
+      - targets: ['host.docker.internal:8000']

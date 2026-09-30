@@ -1,0 +1,37 @@
+# Binaries & Executables
+*.exe
+*.dll
+*.so
+*.dylib
+faultline_engine
+faultline_orchestrator
+
+# C++ Build Artefacts
+engine/build/
+CMakeFiles/
+CMakeCache.txt
+
+# Go
+orchestrator/faultline_orchestrator.exe
+orchestrator/runs/
+orchestrator/event_stream.jsonl
+runs/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.venv/
+env/
+
+# Node & React
+dashboard/node_modules/
+dashboard/dist/
+dashboard/.env.local
+
+# Experiment Outputs & Logs
+results.json
+*.log
+.DS_Store
+Thumbs.db

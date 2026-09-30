@@ -1,0 +1,288 @@
+#pragma once
+
+#include "event.hpp"
+#include "scheduler.hpp"
+#include "node.hpp"
+#include "link.hpp"
+#include "nlohmann/json.hpp"
+#include <fstream>
+#include <iostream>
+#include <unordered_map>
+#include <vector>
+#include <algorithm>
+
+namespace faultline
+{
+
+    using json = nlohmann::json;
+
+    class SimulationEngine
+    {
+    public:
+        SimulationEngine() = default;
+
+        bool load_scenario(const std::string &filepath)
+        {
+            std::ifstream file(filepath);
+            if (!file.is_open())
+            {
+                std::cerr << "Failed to open scenario file: " << filepath << "\n";
+                return false;
+            }
+
+            try
+            {
+                file >> scenario_json_;
+            }
+            catch (const std::exception &e)
+            {
+                std::cerr << "JSON parse error: " << e.what() << "\n";
+                return false;
+            }
+
+            return setup();
+        }
+
+        void run()
+        {
+            SimTime duration_us = MS_TO_US(scenario_json_.value("duration_ms", 1000ULL));
+            scheduler_.run_until(duration_us);
+        }
+
+        void export_results(const std::string &output_filepath)
+        {
+            json out;
+            out["scenario_name"] = scenario_json_.value("name", "Unnamed Scenario");
+            out["simulated_time_ms"] = US_TO_MS(scheduler_.current_time());
+            out["wall_clock_time_ms"] = scheduler_.last_wall_duration_ms();
+            out["total_events_processed"] = scheduler_.total_events_processed();
+
+            // Requests summary
+            uint64_t success = 0;
+            uint64_t failed = 0;
+            std::unordered_map<std::string, uint64_t> failure_reasons;
+            std::vector<double> latencies_ms;
+
+            for (const auto &req : all_requests_)
+            {
+                if (req->is_failed)
+                {
+                    failed++;
+                    failure_reasons[req->failure_reason]++;
+                }
+                else if (req->completed_at > 0)
+                {
+                    success++;
+                    latencies_ms.push_back(US_TO_MS(req->completed_at - req->created_at));
+                }
+            }
+
+            out["metrics"]["total_requests"] = all_requests_.size();
+            out["metrics"]["successful_requests"] = success;
+            out["metrics"]["failed_requests"] = failed;
+            out["metrics"]["availability_percent"] = all_requests_.empty() ? 100.0 : (static_cast<double>(success) / all_requests_.size()) * 100.0;
+            out["metrics"]["failure_breakdown"] = failure_reasons;
+
+            // Latency percentiles
+            if (!latencies_ms.empty())
+            {
+                std::sort(latencies_ms.begin(), latencies_ms.end());
+                out["metrics"]["latency_ms"]["min"] = latencies_ms.front();
+                out["metrics"]["latency_ms"]["p50"] = latencies_ms[latencies_ms.size() * 50 / 100];
+                out["metrics"]["latency_ms"]["p95"] = latencies_ms[latencies_ms.size() * 95 / 100];
+                out["metrics"]["latency_ms"]["p99"] = latencies_ms[latencies_ms.size() * 99 / 100];
+                out["metrics"]["latency_ms"]["max"] = latencies_ms.back();
+            }
+
+            // Per-node stats
+            for (const auto &[id, node] : nodes_)
+            {
+                const auto &s = node->stats();
+                out["nodes"][id] = {
+                    {"received", s.requests_received},
+                    {"processed", s.requests_processed},
+                    {"dropped_queue_full", s.requests_dropped_queue_full},
+                    {"dropped_crashed", s.requests_dropped_crashed},
+                    {"peak_queue_depth", s.peak_queue_depth}};
+            }
+
+            // Per-link stats
+            for (const auto &[id, link] : links_)
+            {
+                const auto &s = link->stats();
+                out["links"][id] = {
+                    {"transmitted", s.packets_transmitted},
+                    {"delivered", s.packets_delivered},
+                    {"dropped_partition", s.packets_dropped_partition},
+                    {"dropped_loss", s.packets_dropped_loss}};
+            }
+
+            std::ofstream out_file(output_filepath);
+            if (out_file.is_open())
+            {
+                out_file << out.dump(4);
+                std::cout << "\nResults successfully written to: " << output_filepath << "\n";
+            }
+            else
+            {
+                std::cerr << "Failed to write results to " << output_filepath << "\n";
+            }
+        }
+
+    private:
+        bool setup()
+        {
+            uint32_t seed = scenario_json_.value("seed", 42);
+
+            // 1. Construct Nodes
+            for (const auto &n : scenario_json_["nodes"])
+            {
+                std::string id = n["id"];
+                size_t concurrency = n.value("concurrency", 4);
+                size_t queue_cap = n.value("queue_capacity", 20);
+                SimTime service_time_us = MS_TO_US(n.value("service_time_ms", 10ULL));
+
+                nodes_[id] = std::make_unique<Node>(id, concurrency, queue_cap, service_time_us);
+            }
+
+            // 2. Construct Links
+            for (const auto &l : scenario_json_["links"])
+            {
+                std::string id = l["id"];
+                std::string src = l["source"];
+                std::string tgt = l["target"];
+                SimTime latency_us = MS_TO_US(l.value("latency_ms", 10ULL));
+                SimTime jitter_us = MS_TO_US(l.value("jitter_ms", 2ULL));
+                double drop_rate = l.value("drop_rate", 0.0);
+
+                links_[id] = std::make_unique<NetworkLink>(id, src, tgt, latency_us, jitter_us, drop_rate, seed++);
+            }
+
+            // 3. Setup Traffic Generator (Workload)
+            if (scenario_json_.contains("workload"))
+            {
+                const auto &w = scenario_json_["workload"];
+                double rps = w.value("requests_per_second", 50.0);
+                SimTime interval_us = static_cast<SimTime>(1000000.0 / rps);
+                SimTime start_us = MS_TO_US(w.value("start_time_ms", 0ULL));
+                SimTime duration_us = MS_TO_US(w.value("duration_ms", 1000ULL));
+                std::vector<std::string> route = w.value("route", std::vector<std::string>{});
+
+                SimTime cur_t = start_us;
+                uint64_t req_id = 1;
+                while (cur_t < start_us + duration_us)
+                {
+                    auto req = std::make_shared<Request>();
+                    req->id = req_id++;
+                    req->created_at = cur_t;
+                    all_requests_.push_back(req);
+
+                    scheduler_.schedule_at(cur_t, EventType::REQUEST_GENERATED, "client", req, [this, req, route]()
+                                           { this->dispatch_request(req, route, 0); });
+
+                    cur_t += interval_us;
+                }
+            }
+
+            // 4. Setup Chaos Fault Events
+            if (scenario_json_.contains("chaos"))
+            {
+                for (const auto &c : scenario_json_["chaos"])
+                {
+                    SimTime fault_time_us = MS_TO_US(c.value("time_ms", 0ULL));
+                    SimTime duration_us = MS_TO_US(c.value("duration_ms", 500ULL));
+                    std::string type = c.value("type", "");
+                    std::string target = c.value("target", "");
+
+                    if (type == "NODE_CRASH" && nodes_.count(target))
+                    {
+                        // Inject crash
+                        scheduler_.schedule_at(fault_time_us, EventType::NODE_CRASH, target, nullptr, [this, target]()
+                                               {
+                        std::cout << "[CHAOS] Node crashed: " << target << "\n";
+                        this->nodes_[target]->crash(); });
+                        // Schedule reboot after duration
+                        scheduler_.schedule_at(fault_time_us + duration_us, EventType::NODE_RECOVER, target, nullptr, [this, target]()
+                                               {
+                        std::cout << "[RECOVERY] Node recovered: " << target << "\n";
+                        this->nodes_[target]->recover(); });
+                    }
+                    else if (type == "NETWORK_PARTITION" && links_.count(target))
+                    {
+                        // Cut link
+                        scheduler_.schedule_at(fault_time_us, EventType::LINK_DEGRADE, target, nullptr, [this, target]()
+                                               {
+                        std::cout << "[CHAOS] Network partitioned: " << target << "\n";
+                        this->links_[target]->partition(); });
+                        // Heal link
+                        scheduler_.schedule_at(fault_time_us + duration_us, EventType::LINK_RESTORE, target, nullptr, [this, target]()
+                                               {
+                        std::cout << "[RECOVERY] Network healed: " << target << "\n";
+                        this->links_[target]->heal(); });
+                    }
+                }
+            }
+
+            return true;
+        }
+
+        /**
+         * Recursively traverses request across the route hops (Gateway -> Order -> Payment).
+         */
+        void dispatch_request(std::shared_ptr<Request> req, const std::vector<std::string> &route, size_t hop_idx)
+        {
+            if (hop_idx >= route.size())
+            {
+                req->completed_at = scheduler_.current_time();
+                return;
+            }
+
+            const std::string &current_node_id = route[hop_idx];
+            auto &current_node = nodes_[current_node_id];
+
+            current_node->receive_request(scheduler_, req);
+
+            if (req->is_failed)
+            {
+                return; // Request dropped at current node
+            }
+
+            // If there's a next hop, find the link connecting them
+            if (hop_idx + 1 < route.size())
+            {
+                const std::string &next_node_id = route[hop_idx + 1];
+                NetworkLink *found_link = nullptr;
+                for (auto &[id, link] : links_)
+                {
+                    if (link->source_id() == current_node_id && link->target_id() == next_node_id)
+                    {
+                        found_link = link.get();
+                        break;
+                    }
+                }
+
+                if (found_link)
+                {
+                    found_link->transmit(scheduler_, req, [this, req, route, hop_idx](std::shared_ptr<Request> delivered_req)
+                                         { this->dispatch_request(delivered_req, route, hop_idx + 1); });
+                }
+                else
+                {
+                    // Direct hop if no explicit link configured
+                    dispatch_request(req, route, hop_idx + 1);
+                }
+            }
+            else
+            {
+                req->completed_at = scheduler_.current_time();
+            }
+        }
+
+        Scheduler scheduler_;
+        json scenario_json_;
+        std::unordered_map<std::string, std::unique_ptr<Node>> nodes_;
+        std::unordered_map<std::string, std::unique_ptr<NetworkLink>> links_;
+        std::vector<std::shared_ptr<Request>> all_requests_;
+    };
+
+} // namespace faultline
