@@ -3,11 +3,14 @@
 ### Deterministic Distributed Systems Failure Simulation Engine
 
 [![CI](https://github.com/rahul-1909/faultline-simulator/actions/workflows/ci.yml/badge.svg)](https://github.com/rahul-1909/faultline-simulator/actions/workflows/ci.yml)
+[![Live Demo](https://img.shields.io/badge/Live_Demo-faultline--cvza.onrender.com-00B4D8?style=flat&logo=render&logoColor=white)](https://faultline-cvza.onrender.com/)
 [![C++17](https://img.shields.io/badge/C%2B%2B-17-blue.svg)](https://isocpp.org/)
 [![Go](https://img.shields.io/badge/Go-1.23-00ADD8.svg)](https://golang.org/)
 [![Python](https://img.shields.io/badge/Python-3.12-3776AB.svg)](https://python.org/)
 [![React](https://img.shields.io/badge/React-18-61DAFB.svg)](https://react.dev/)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+
+> **Live Deployment**: Access the live interactive web dashboard and simulation engine at [https://faultline-cvza.onrender.com/](https://faultline-cvza.onrender.com/).
 
 ---
 
@@ -17,7 +20,7 @@ Modern microservice architectures at hyperscalers (such as Netflix, Amazon, Uber
 - **Cascading Failures**: When downstream dependencies degrade, bounded queues saturate and backpressure propagates upstream until edge gateways fail.
 - **Retry Storms & Stampedes**: Naive retries amplify traffic on recovering services, turning transient blips into persistent outages.
 - **Network Partitions & Link Degradation**: Severed links drop in-flight packets, stranding upstream callers and triggering queue timeouts.
-- **Tail Latency Explosions**: Concurrency bottlenecks push $p_{95}$ and $p_{99}$ latency past timeout thresholds.
+- **Tail Latency Explosions**: Concurrency bottlenecks push p95 and p99 latency past timeout thresholds.
 
 Testing these failure scenarios in physical staging environments or via wall-clock emulation is slow, expensive, and non-deterministic.
 
@@ -27,7 +30,12 @@ Testing these failure scenarios in physical staging environments or via wall-clo
 
 ## 2. Architecture Overview
 
-Faultline consists of decoupled subsystems coordinated across event streaming, analytics, and observability layers:
+Faultline supports two execution models:
+
+1. **Unified Cloud Service (Render / Production)**: A multi-stage container that co-locates the C++17 discrete-event simulation engine, the Python FastAPI analytics daemon, and the Go HTTP orchestrator. The Go orchestrator serves the precompiled React 18 frontend at `/`, proxies analytics requests to FastAPI internally, manages simulation subprocesses, and exports Prometheus metrics—all accessible through a single public URL.
+2. **Distributed Microservices Stack (Docker Compose)**: Isolates services across individual containers, streaming simulation lifecycle events through a Redpanda (Kafka) broker to an asynchronous Python analytics consumer, with Prometheus and Grafana for time-series observability.
+
+### Distributed Event-Driven Topology
 
 ```mermaid
 flowchart TD
@@ -78,32 +86,32 @@ Faultline models a multi-tier microservice architecture handling e-commerce orde
 
 ```
 [ Edge Clients ]
-       │
-       ▼ (Link L1: Latency 2ms, Loss 0.0)
-┌──────────────┐
-│  API Gateway │ (Workers: 8, Queue: 100, Base Latency: 5ms)
-└──────┬───────┘
-       │ (Link L2: Latency 4ms, Loss 0.0)
-       ▼
-┌──────────────┐
-│ Order Service│ (Workers: 4, Queue: 50, Base Latency: 15ms)
-└──────┬───────┘
-       │ (Link L3: Latency 10ms, Subject to Chaos Partition)
-       ▼
-┌──────────────┐
-│Payment Service│ (Workers: 2, Queue: 20, Base Latency: 45ms)  <-- Common Bottleneck
-└──────┬───────┘
-       │ (Link L4: Latency 3ms, Loss 0.0)
-       ▼
-┌──────────────┐
-│ Inventory Svc│ (Workers: 4, Queue: 50, Base Latency: 10ms)
-└──────────────┘
+       |
+       v (Link L1: Latency 2ms, Loss 0.0)
++--------------+
+|  API Gateway | (Workers: 8, Queue: 100, Base Latency: 5ms)
++------+-------+
+       | (Link L2: Latency 4ms, Loss 0.0)
+       v
++--------------+
+| Order Service| (Workers: 4, Queue: 50, Base Latency: 15ms)
++------+-------+
+       | (Link L3: Latency 10ms, Subject to Chaos Partition)
+       v
++--------------+
+|Payment Service| (Workers: 2, Queue: 20, Base Latency: 45ms)  <-- Common Bottleneck
++------+-------+
+       | (Link L4: Latency 3ms, Loss 0.0)
+       v
++--------------+
+| Inventory Svc| (Workers: 4, Queue: 50, Base Latency: 10ms)
++--------------+
 ```
 
 ### Request Flow & State Transitions:
 1. **Edge Dispatch**: Requests arrive according to constant or Poisson distributions.
 2. **Worker Scheduling & Queueing**: Arriving requests enter worker slots. If workers are saturated, requests enter a bounded FIFO queue. If the queue is full, the request is dropped immediately (`QUEUE_FULL`).
-3. **Multi-Hop Sequential Processing**: A request completes execution at node $N$ before transmitting across network link $L$ to node $N+1$. Queueing delay, worker service time, and network latency are accumulated into total end-to-end latency.
+3. **Multi-Hop Sequential Processing**: A request completes execution at node N before transmitting across network link L to node N+1. Queueing delay, worker service time, and network latency are accumulated into total end-to-end latency.
 4. **Terminal States**: Every request reaches an unambiguous terminal state: `SUCCEEDED` only upon completion of the final service hop, or `FAILED` if dropped due to node crash (`NODE_DOWN`), queue saturation (`QUEUE_FULL`), network partition (`NETWORK_PARTITION`), packet loss (`PACKET_LOSS`), or retry exhaustion (`RETRY_EXHAUSTED`).
 
 ---
@@ -238,26 +246,44 @@ Scenarios support both canonical keys and backward-compatible aliases:
 ```
 
 ### Supported Schema Aliases:
-- `workload.requests_per_second` $\leftrightarrow$ `workload.arrival_rate_rps`
-- `nodes[].concurrency` $\leftrightarrow$ `nodes[].workers`
-- `nodes[].service_time_ms` $\leftrightarrow$ `nodes[].processing_time_ms`
-- `links[].drop_rate` $\leftrightarrow$ `links[].loss_rate`
-- `chaos` $\leftrightarrow$ `events`
+- `workload.requests_per_second` <-> `workload.arrival_rate_rps`
+- `nodes[].concurrency` <-> `nodes[].workers`
+- `nodes[].service_time_ms` <-> `nodes[].processing_time_ms`
+- `links[].drop_rate` <-> `links[].loss_rate`
+- `chaos` <-> `events`
 
 ---
 
 ## 8. Deployment & Quickstart
 
-### Running with Docker Compose
+Faultline provides two deployment options: single-container unified web service and multi-container Docker Compose.
 
-Deploy the complete multi-container stack with a single command:
+### Option A: Unified Cloud Web Service (Render / Docker)
+
+The unified deployment packages the entire stack (C++ engine, Python FastAPI analytics, Go orchestrator, and React frontend) into a single container. The Go orchestrator serves the React dashboard at `/` and handles all API routes:
+
+- **Live URL**: [https://faultline-cvza.onrender.com/](https://faultline-cvza.onrender.com/)
+- **Configuration**: Defined in `render.yaml` and `Dockerfile`.
+
+To build and run the unified container locally:
+
+```bash
+docker build -t faultline:latest .
+docker run -p 8080:8080 -e PORT=8080 faultline:latest
+```
+
+Then open `http://localhost:8080` in your browser.
+
+### Option B: Distributed Stack with Docker Compose
+
+To run the complete distributed stack with independent microservice containers, Redpanda event streaming broker, Prometheus, and Grafana:
 
 ```bash
 cd deploy
 docker compose up --build -d
 ```
 
-### Stack Components & Endpoints:
+### Stack Components & Endpoints (Docker Compose):
 
 | Service | Port | Description |
 | :--- | :--- | :--- |
@@ -271,11 +297,13 @@ docker compose up --build -d
 | **Grafana** | `http://localhost:3001` | Pre-provisioned dashboards (`admin` / `faultline`) |
 
 ### Environment Configuration:
+- `PORT`: Public HTTP port for the web service (default `8080`).
+- `STATIC_DIR`: Path to the compiled React distribution (default `/app/dashboard/dist`).
+- `ANALYTICS_URL`: Internal URL for the Python analytics daemon (default `http://127.0.0.1:8000`).
 - `KAFKA_BROKER`: Broker address (default `redpanda:29092` in Docker, `localhost:9092` locally).
 - `KAFKA_TOPIC`: Event stream topic name (default `faultline.experiments`).
 - `KAFKA_GROUP_ID`: Consumer group ID (default `faultline-analytics-group`).
 - `ORCHESTRATOR_URL`: Orchestrator base URL (default `http://localhost:8080`).
-- `ANALYTICS_URL`: Analytics base URL (default `http://localhost:8000`).
 
 ---
 
@@ -330,13 +358,13 @@ g++ -std=c++17 -Wall -Wextra -pedantic -static -Iinclude tests/test_engine.cpp -
 ```
 *Result: 14/14 PASSED.*
 
-### 2. Go Orchestrator Unit & Concurrency Tests (7 Tests with Race Detector)
-Validates pure-Go Kafka publisher with graceful offline fallback, `/healthz` engine readiness check, `/metrics` Prometheus exposition, scenario validation, `DELETE` and `/cancel` endpoints, queued job cancellation, and thread-safe concurrent access:
+### 2. Go Orchestrator Unit & Concurrency Tests (13 Tests)
+Validates pure-Go Kafka publisher with graceful offline fallback, `/health` engine readiness check, `/metrics` Prometheus exposition, scenario validation, `DELETE` and `/cancel` endpoints, queued job cancellation, and thread-safe concurrent access across `events`, `handler`, and `service` packages:
 ```bash
 cd orchestrator
-go test -v -race ./...
+go test -v ./...
 ```
-*Result: 7/7 PASSED with 0 data races.*
+*Result: 13/13 PASSED.*
 
 ### 3. Python Analytics & Consumer Integration Tests (10 Tests)
 Validates statistical analysis, metric validation, count consistency, percentile monotonicity, `controlled_retry` and `architecture_comparison` modes, schema validation, consumer lifecycle events (`QUEUED`, `STARTED`, `COMPLETED`, `FAILED`, `CANCELLED`), and event stream ingestion:
@@ -357,20 +385,35 @@ npm run build
 
 ## 11. API Reference
 
-### Go Orchestrator (`http://localhost:8080`)
-- `GET /health` — Returns status of orchestrator and checks whether the C++ engine binary can execute.
-- `GET /metrics` — Prometheus metrics scraping endpoint (`faultline_simulation_engine_ready`, active experiments, total runs).
-- `GET /api/v1/experiments` — Lists simulation experiments sorted chronologically.
-- `POST /api/v1/experiments` — Validates and submits a scenario. Add `?wait=true` for synchronous execution.
-- `GET /api/v1/experiments/{id}` — Retrieves experiment status, scenario, and output metrics.
-- `DELETE /api/v1/experiments/{id}` / `POST /api/v1/experiments/{id}/cancel` — Cancels an in-flight or queued experiment.
+### Unified Gateway & Go Orchestrator
 
-### Python Analytics Service (`http://localhost:8000`)
-- `GET /health` — Health check endpoint.
-- `GET /metrics` — Prometheus metrics endpoint.
-- `POST /api/v1/analyze` — Computes SRI, failure cause ranking, and bottleneck diagnoses.
-- `POST /api/v1/compare` — Performs A/B comparison (`controlled_retry` or `architecture_comparison`).
-- `GET /api/v1/experiments/{id}/analysis` — Retrieves experiment data and computes full diagnostics.
+When running the unified service or Go orchestrator with `ANALYTICS_URL` configured, all endpoints are served through a single port:
+
+| Method | Endpoint | Description |
+| :--- | :--- | :--- |
+| `GET` | `/` | Serves the interactive React single-page application |
+| `GET` | `/health` | Health check verifying orchestrator status and C++ engine binary readiness |
+| `GET` | `/metrics` | Prometheus metrics scraping endpoint (`faultline_simulation_engine_ready`, active experiments, status counters) |
+| `GET` | `/api/v1/experiments` | Lists simulation experiments sorted chronologically |
+| `POST` | `/api/v1/experiments` | Submits a simulation scenario. Add query parameter `?wait=true` for synchronous execution |
+| `GET` | `/api/v1/experiments/{id}` | Retrieves experiment details, status, and raw engine metrics |
+| `DELETE` | `/api/v1/experiments/{id}` | Cancels an active or queued experiment |
+| `POST` | `/api/v1/experiments/{id}/cancel` | Alternate endpoint for experiment cancellation |
+| `POST` | `/api/v1/analyze` | Proxied to FastAPI: computes SRI, failure cause ranking, and bottleneck diagnoses |
+| `POST` | `/api/v1/compare` | Proxied to FastAPI: executes A/B comparison across two experiments |
+| `GET` | `/api/v1/experiments/{id}/analysis` | Proxied to FastAPI: retrieves experiment and generates full statistical diagnosis |
+
+### Standalone Python Analytics Service (`http://localhost:8000`)
+
+When running in distributed mode, the Python analytics service also provides direct HTTP access:
+
+| Method | Endpoint | Description |
+| :--- | :--- | :--- |
+| `GET` | `/health` | Analytics service health check |
+| `GET` | `/metrics` | Prometheus metrics exposition |
+| `POST` | `/api/v1/analyze` | Computes SRI score and failure ranking |
+| `POST` | `/api/v1/compare` | Performs A/B delta comparison |
+| `GET` | `/api/v1/experiments/{id}/analysis` | Analyzes results for a given experiment ID |
 
 ---
 
