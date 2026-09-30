@@ -1,0 +1,148 @@
+{
+  "annotations": {
+    "list": []
+  },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "id": null,
+  "links": [],
+  "liveNow": false,
+  "panels": [
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 0,
+        "y": 0
+      },
+      "id": 1,
+      "title": "Completed Experiments",
+      "type": "stat",
+      "targets": [
+        {
+          "datasource": "Prometheus",
+          "expr": "faultline_experiments_total{status=\"COMPLETED\"}",
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      }
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 6,
+        "y": 0
+      },
+      "id": 2,
+      "title": "Failed Experiments",
+      "type": "stat",
+      "targets": [
+        {
+          "datasource": "Prometheus",
+          "expr": "faultline_experiments_total{status=\"FAILED\"}",
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none"
+      }
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 12,
+        "y": 0
+      },
+      "id": 3,
+      "title": "Active Simulations",
+      "type": "stat",
+      "targets": [
+        {
+          "datasource": "Prometheus",
+          "expr": "faultline_experiments_active",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 18,
+        "y": 0
+      },
+      "id": 4,
+      "title": "Simulation Engine Ready",
+      "type": "stat",
+      "targets": [
+        {
+          "datasource": "Prometheus",
+          "expr": "faultline_simulation_engine_ready",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 4
+      },
+      "id": 5,
+      "title": "Experiment Execution Duration (ms)",
+      "type": "timeseries",
+      "targets": [
+        {
+          "datasource": "Prometheus",
+          "expr": "faultline_last_simulation_duration_ms",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 4
+      },
+      "id": 6,
+      "title": "System Reliability Index (SRI %)",
+      "type": "timeseries",
+      "targets": [
+        {
+          "datasource": "Prometheus",
+          "expr": "faultline_last_reliability_index",
+          "refId": "A"
+        }
+      ]
+    }
+  ],
+  "refresh": "5s",
+  "schemaVersion": 39,
+  "tags": ["faultline", "simulation"],
+  "time": {
+    "from": "now-15m",
+    "to": "now"
+  },
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "Faultline Distributed Systems Overview",
+  "uid": "faultline-overview",
+  "version": 1
+}

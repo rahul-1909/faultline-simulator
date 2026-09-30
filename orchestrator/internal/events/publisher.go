@@ -1,13 +1,15 @@
 package events
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
-	"net"
 	"os"
 	"sync"
 	"time"
+
+	"github.com/segmentio/kafka-go"
 )
 
 type EventType string
@@ -17,6 +19,7 @@ const (
 	EventExperimentStarted   EventType = "EXPERIMENT_STARTED"
 	EventExperimentCompleted EventType = "EXPERIMENT_COMPLETED"
 	EventExperimentFailed    EventType = "EXPERIMENT_FAILED"
+	EventExperimentCancelled EventType = "EXPERIMENT_CANCELLED"
 )
 
 // SimulationLifecycleEvent represents an event published to Kafka / Redpanda.
@@ -34,13 +37,12 @@ type Publisher interface {
 	Close() error
 }
 
-// KafkaStreamPublisher handles publishing to a Kafka / Redpanda broker.
-// Includes graceful fallback when the broker is offline.
+// KafkaStreamPublisher handles publishing to a Kafka / Redpanda broker using genuine Kafka wire protocol.
 type KafkaStreamPublisher struct {
-	mu           sync.Mutex
-	brokerAddr   string
-	topic        string
-	isBrokerLive bool
+	mu         sync.Mutex
+	writer     *kafka.Writer
+	brokerAddr string
+	topic      string
 }
 
 func NewKafkaPublisher(brokerAddr, topic string) *KafkaStreamPublisher {
@@ -51,27 +53,26 @@ func NewKafkaPublisher(brokerAddr, topic string) *KafkaStreamPublisher {
 		}
 	}
 	if topic == "" {
-		topic = "faultline.experiments"
+		topic = os.Getenv("KAFKA_TOPIC")
+		if topic == "" {
+			topic = "faultline.experiments"
+		}
 	}
 
-	p := &KafkaStreamPublisher{
+	w := &kafka.Writer{
+		Addr:         kafka.TCP(brokerAddr),
+		Topic:        topic,
+		Balancer:     &kafka.LeastBytes{},
+		WriteTimeout: 2 * time.Second,
+		ReadTimeout:  2 * time.Second,
+		MaxAttempts:  3,
+	}
+
+	return &KafkaStreamPublisher{
+		writer:     w,
 		brokerAddr: brokerAddr,
 		topic:      topic,
 	}
-
-	p.checkBroker()
-	return p
-}
-
-func (p *KafkaStreamPublisher) checkBroker() bool {
-	conn, err := net.DialTimeout("tcp", p.brokerAddr, 500*time.Millisecond)
-	if err != nil {
-		p.isBrokerLive = false
-		return false
-	}
-	_ = conn.Close()
-	p.isBrokerLive = true
-	return true
 }
 
 func (p *KafkaStreamPublisher) Publish(event SimulationLifecycleEvent) error {
@@ -83,33 +84,35 @@ func (p *KafkaStreamPublisher) Publish(event SimulationLifecycleEvent) error {
 		return fmt.Errorf("failed to marshal event: %w", err)
 	}
 
-	// Periodically test broker connectivity if it was previously offline
-	if !p.isBrokerLive {
-		p.checkBroker()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	msg := kafka.Message{
+		Key:   []byte(event.ExperimentID),
+		Value: data,
+		Time:  event.Timestamp,
 	}
 
-	if p.isBrokerLive {
-		// Connected to live Kafka/Redpanda broker
-		log.Printf("[KAFKA PUBLISH] Topic: '%s' | Event: %s | ExpID: %s\n", p.topic, event.EventType, event.ExperimentID)
-		// Transmit raw event stream to broker socket
-		conn, err := net.DialTimeout("tcp", p.brokerAddr, 1*time.Second)
-		if err == nil {
-			defer conn.Close()
-			_, _ = conn.Write(append(data, '\n'))
+	if p.writer != nil {
+		if err := p.writer.WriteMessages(ctx, msg); err != nil {
+			log.Printf("[KAFKA] Notice: broker %s not connected (%v). Buffered in local event stream.\n", p.brokerAddr, err)
+		} else {
+			log.Printf("[KAFKA PUBLISH] Topic: '%s' | Event: %s | ExpID: %s\n", p.topic, event.EventType, event.ExperimentID)
 		}
-	} else {
-		// Local event streaming logger
-		log.Printf("[EVENT STREAM] (%s) %s -> %s [Broker: %s offline, buffered in event log]\n",
-			p.topic, event.EventType, event.ExperimentID, p.brokerAddr)
 	}
 
-	// Persist event to append-only event-stream file (Event Sourcing)
+	// Persist event to append-only event-stream file (local Event Sourcing & offline fallback)
 	_ = appendEventLog(data)
 
 	return nil
 }
 
 func (p *KafkaStreamPublisher) Close() error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.writer != nil {
+		return p.writer.Close()
+	}
 	return nil
 }
 
@@ -119,6 +122,9 @@ func appendEventLog(data []byte) error {
 		return err
 	}
 	defer f.Close()
-	_, err = f.Write(append(data, '\n'))
-	return err
+
+	if _, err := f.Write(append(data, '\n')); err != nil {
+		return err
+	}
+	return nil
 }

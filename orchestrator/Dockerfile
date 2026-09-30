@@ -6,9 +6,9 @@ COPY engine/src/ ./engine/src/
 RUN g++ -std=c++17 -O3 -static -I engine/include engine/src/main.cpp -o /cpp/faultline_engine
 
 # Step 2: Build Go Orchestrator
-FROM golang:1.22-alpine AS go-builder
+FROM golang:1.23-alpine AS go-builder
 WORKDIR /go/src/app
-COPY orchestrator/go.mod ./
+COPY orchestrator/go.mod orchestrator/go.sum* ./
 COPY orchestrator/ ./
 RUN CGO_ENABLED=0 GOOS=linux go build -o /go/bin/faultline_orchestrator ./cmd/server
 

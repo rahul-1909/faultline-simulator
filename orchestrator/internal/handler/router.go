@@ -39,7 +39,7 @@ func (h *APIHandler) handleHealth(w http.ResponseWriter, r *http.Request) {
 
 func (h *APIHandler) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	experiments := h.orch.ListExperiments()
-	var completed, failed, running int
+	var completed, failed, cancelled, queued, running int
 	var lastDuration float64
 
 	for _, exp := range experiments {
@@ -49,9 +49,19 @@ func (h *APIHandler) handleMetrics(w http.ResponseWriter, r *http.Request) {
 			lastDuration = exp.DurationMs
 		case model.StatusFailed:
 			failed++
+		case model.StatusCancelled:
+			cancelled++
+		case model.StatusQueued:
+			queued++
 		case model.StatusRunning:
 			running++
 		}
+	}
+
+	ready, _ := h.orch.EngineReady()
+	readyVal := 0
+	if ready {
+		readyVal = 1
 	}
 
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
@@ -61,12 +71,17 @@ func (h *APIHandler) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "# TYPE faultline_experiments_total counter\n")
 	fmt.Fprintf(w, "faultline_experiments_total{status=\"COMPLETED\"} %d\n", completed)
 	fmt.Fprintf(w, "faultline_experiments_total{status=\"FAILED\"} %d\n", failed)
+	fmt.Fprintf(w, "faultline_experiments_total{status=\"CANCELLED\"} %d\n", cancelled)
+	fmt.Fprintf(w, "faultline_experiments_total{status=\"QUEUED\"} %d\n", queued)
 	fmt.Fprintf(w, "# HELP faultline_experiments_active Currently executing experiments.\n")
 	fmt.Fprintf(w, "# TYPE faultline_experiments_active gauge\n")
 	fmt.Fprintf(w, "faultline_experiments_active %d\n", running)
 	fmt.Fprintf(w, "# HELP faultline_last_simulation_duration_ms Wall-clock execution time of last simulation run.\n")
 	fmt.Fprintf(w, "# TYPE faultline_last_simulation_duration_ms gauge\n")
 	fmt.Fprintf(w, "faultline_last_simulation_duration_ms %.2f\n", lastDuration)
+	fmt.Fprintf(w, "# HELP faultline_simulation_engine_ready Whether the C++ simulation engine binary is verified ready.\n")
+	fmt.Fprintf(w, "# TYPE faultline_simulation_engine_ready gauge\n")
+	fmt.Fprintf(w, "faultline_simulation_engine_ready %d\n", readyVal)
 }
 
 func (h *APIHandler) handleExperiments(w http.ResponseWriter, r *http.Request) {
@@ -92,7 +107,7 @@ func (h *APIHandler) handleExperiments(w http.ResponseWriter, r *http.Request) {
 
 		exp, err := h.orch.CreateExperiment(req.Name, req.Scenario)
 		if err != nil {
-			writeError(w, http.StatusInternalServerError, "Failed to create experiment: "+err.Error())
+			writeError(w, http.StatusBadRequest, "Failed to create experiment: "+err.Error())
 			return
 		}
 
@@ -110,11 +125,16 @@ func (h *APIHandler) handleExperiments(w http.ResponseWriter, r *http.Request) {
 			for {
 				select {
 				case <-timeout:
-					writeJSON(w, http.StatusAccepted, exp)
+					current, _ := h.orch.GetExperiment(exp.ID)
+					if current != nil {
+						writeJSON(w, http.StatusAccepted, current)
+					} else {
+						writeJSON(w, http.StatusAccepted, exp)
+					}
 					return
 				case <-ticker.C:
 					updated, _ := h.orch.GetExperiment(exp.ID)
-					if updated != nil && (updated.Status == model.StatusCompleted || updated.Status == model.StatusFailed) {
+					if updated != nil && (updated.Status == model.StatusCompleted || updated.Status == model.StatusFailed || updated.Status == model.StatusCancelled) {
 						writeJSON(w, http.StatusOK, updated)
 						return
 					}
@@ -144,6 +164,16 @@ func (h *APIHandler) handleExperimentByID(w http.ResponseWriter, r *http.Request
 			return
 		}
 		if err := h.orch.CancelExperiment(expID); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"message": "Experiment cancelled successfully"})
+		return
+	}
+
+	// Support DELETE /api/v1/experiments/{id} for direct cancellation
+	if r.Method == http.MethodDelete {
+		if err := h.orch.CancelExperiment(id); err != nil {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}

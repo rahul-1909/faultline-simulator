@@ -347,6 +347,97 @@ void test_scenario_reproducibility() {
     std::cout << "PASSED (Identical event trace count)\n";
 }
 
+// 12. Missing route links rejected at validation
+void test_missing_route_link_rejected() {
+    std::cout << "[TEST 12] Missing route link rejection... ";
+    SimulationEngine engine;
+    json scen = {
+        {"name", "Missing Link Route"},
+        {"duration_ms", 500},
+        {"nodes", {
+            {{"id", "gw"}, {"concurrency", 4}, {"queue_capacity", 20}, {"service_time_ms", 5}},
+            {{"id", "svc"}, {"concurrency", 2}, {"queue_capacity", 10}, {"service_time_ms", 15}}
+        }},
+        {"links", json::array()}, // No link between gw and svc!
+        {"workload", {
+            {"requests_per_second", 40.0},
+            {"route", {"gw", "svc"}}
+        }}
+    };
+
+    // Must be rejected because no link connects gw -> svc
+    assert(!engine.load_scenario_from_json(scen));
+    std::cout << "PASSED (Missing link correctly detected and rejected)\n";
+}
+
+// 13. Schema backward compatibility aliases (workers, processing_time_ms, arrival_rate_rps, events)
+void test_schema_backward_compatibility() {
+    std::cout << "[TEST 13] Schema compatibility aliases... ";
+    SimulationEngine engine;
+    json scen = {
+        {"name", "Legacy Alias Test"},
+        {"duration_ms", 500},
+        {"nodes", {
+            {{"id", "gw"}, {"workers", 4}, {"queue_capacity", 20}, {"processing_time_ms", 5}},
+            {{"id", "svc"}, {"workers", 2}, {"queue_capacity", 10}, {"processing_time_ms", 15}}
+        }},
+        {"links", {
+            {{"id", "l1"}, {"source", "gw"}, {"target", "svc"}, {"latency_ms", 5}, {"drop_rate", 0.0}}
+        }},
+        {"workload", {
+            {"arrival_rate_rps", 50.0},
+            {"start_time_ms", 0},
+            {"duration_ms", 200},
+            {"route", {"gw", "svc"}}
+        }},
+        {"events", {
+            {{"time_ms", 100}, {"type", "CRASH_NODE"}, {"target", "svc"}, {"duration_ms", 50}}
+        }}
+    };
+
+    assert(engine.load_scenario_from_json(scen));
+    engine.run();
+    std::cout << "PASSED (Legacy schema aliases seamlessly supported)\n";
+}
+
+// 14. Documented nearest-rank percentiles calculation correctness
+void test_percentile_precision() {
+    std::cout << "[TEST 14] Nearest-rank latency percentiles precision... ";
+    SimulationEngine engine;
+    json scen = {
+        {"name", "Percentile Test"},
+        {"duration_ms", 1000},
+        {"nodes", {
+            {{"id", "n1"}, {"concurrency", 10}, {"queue_capacity", 100}, {"service_time_ms", 10}}
+        }},
+        {"links", json::array()},
+        {"workload", {
+            {"requests_per_second", 10.0},
+            {"start_time_ms", 0},
+            {"duration_ms", 500},
+            {"route", {"n1"}}
+        }}
+    };
+
+    assert(engine.load_scenario_from_json(scen));
+    engine.run();
+    engine.export_results("test_percentiles.json");
+
+    std::ifstream f("test_percentiles.json");
+    assert(f.is_open());
+    json res;
+    f >> res;
+    f.close();
+    std::remove("test_percentiles.json");
+
+    assert(res["metrics"]["successful_requests"] > 0);
+    assert(res["metrics"]["latency_ms"]["p50"] >= 10.0);
+    assert(res["metrics"]["latency_ms"]["p95"] >= res["metrics"]["latency_ms"]["p50"]);
+    assert(res["metrics"]["latency_ms"]["p99"] >= res["metrics"]["latency_ms"]["p95"]);
+    assert(res["metrics"]["latency_ms"]["max"] >= res["metrics"]["latency_ms"]["p99"]);
+    std::cout << "PASSED (p50 <= p95 <= p99 <= max verified)\n";
+}
+
 int main() {
     std::cout << "=========================================================\n";
     std::cout << "  FAULTLINE: C++ SIMULATION ENGINE REGRESSION SUITE\n";
@@ -363,9 +454,12 @@ int main() {
     test_crash_queue_eviction();
     test_scenario_validation();
     test_scenario_reproducibility();
+    test_missing_route_link_rejected();
+    test_schema_backward_compatibility();
+    test_percentile_precision();
 
     std::cout << "\n=========================================================\n";
-    std::cout << "  ALL 11 C++ REGRESSION TESTS PASSED! (11/11)\n";
+    std::cout << "  ALL 14 C++ REGRESSION TESTS PASSED! (14/14)\n";
     std::cout << "=========================================================\n";
     return 0;
 }

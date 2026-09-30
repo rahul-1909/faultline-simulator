@@ -12,8 +12,14 @@ services:
     environment:
       - PORT=8080
       - KAFKA_BROKER=redpanda:29092
+      - KAFKA_TOPIC=faultline.experiments
     depends_on:
       - redpanda
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
 
   # 2. Python FastAPI Analytics Engine
   analytics:
@@ -25,8 +31,15 @@ services:
       - "8000:8000"
     environment:
       - ORCHESTRATOR_URL=http://orchestrator:8080
+      - KAFKA_BROKER=redpanda:29092
+      - KAFKA_TOPIC=faultline.experiments
     depends_on:
       - orchestrator
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
 
   # 3. React + TypeScript Dashboard
   dashboard:
@@ -84,6 +97,10 @@ services:
   grafana:
     image: grafana/grafana:10.3.3
     container_name: faultline-grafana
+    volumes:
+      - ./grafana/provisioning/datasources:/etc/grafana/provisioning/datasources
+      - ./grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards
+      - ./grafana/dashboards:/var/lib/grafana/dashboards
     ports:
       - "3001:3000"
     environment:

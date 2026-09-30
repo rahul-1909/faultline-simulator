@@ -98,14 +98,20 @@ namespace faultline
             out["metrics"]["availability_percent"] = all_requests_.empty() ? 100.0 : (static_cast<double>(success) / all_requests_.size()) * 100.0;
             out["metrics"]["failure_breakdown"] = failure_reasons;
 
-            // Latency percentiles
+            // Latency percentiles (documented nearest-rank calculation)
             if (!latencies_ms.empty())
             {
                 std::sort(latencies_ms.begin(), latencies_ms.end());
+                auto calc_p = [&](double p) -> double {
+                    size_t rank = static_cast<size_t>(std::ceil(p * latencies_ms.size()));
+                    if (rank == 0) rank = 1;
+                    if (rank > latencies_ms.size()) rank = latencies_ms.size();
+                    return latencies_ms[rank - 1];
+                };
                 out["metrics"]["latency_ms"]["min"] = latencies_ms.front();
-                out["metrics"]["latency_ms"]["p50"] = latencies_ms[static_cast<size_t>(latencies_ms.size() * 0.50)];
-                out["metrics"]["latency_ms"]["p95"] = latencies_ms[static_cast<size_t>(latencies_ms.size() * 0.95)];
-                out["metrics"]["latency_ms"]["p99"] = latencies_ms[static_cast<size_t>(latencies_ms.size() * 0.99)];
+                out["metrics"]["latency_ms"]["p50"] = calc_p(0.50);
+                out["metrics"]["latency_ms"]["p95"] = calc_p(0.95);
+                out["metrics"]["latency_ms"]["p99"] = calc_p(0.99);
                 out["metrics"]["latency_ms"]["max"] = latencies_ms.back();
             }
             else
@@ -220,7 +226,9 @@ namespace faultline
                 }
                 node_ids[id] = true;
 
-                if (n.value("concurrency", 4) <= 0)
+                // Support both canonical 'concurrency' and legacy 'workers'
+                int concurrency = n.contains("concurrency") ? n.value("concurrency", 4) : n.value("workers", 4);
+                if (concurrency <= 0)
                 {
                     std::cerr << "[Validation Error] Node " << id << " concurrency must be > 0.\n";
                     return false;
@@ -230,7 +238,9 @@ namespace faultline
                     std::cerr << "[Validation Error] Node " << id << " queue_capacity cannot be negative.\n";
                     return false;
                 }
-                if (n.value("service_time_ms", 10ULL) > 3600000ULL)
+                // Support both canonical 'service_time_ms' and legacy 'processing_time_ms'
+                uint64_t svc_time = n.contains("service_time_ms") ? n.value("service_time_ms", 10ULL) : n.value("processing_time_ms", 10ULL);
+                if (svc_time > 3600000ULL)
                 {
                     std::cerr << "[Validation Error] Node " << id << " service_time_ms is invalid.\n";
                     return false;
@@ -239,6 +249,7 @@ namespace faultline
 
             // Links check
             std::unordered_map<std::string, bool> link_ids;
+            std::unordered_map<std::string, bool> connected_pairs;
             if (scenario_json_.contains("links") && scenario_json_["links"].is_array())
             {
                 for (const auto &l : scenario_json_["links"])
@@ -257,6 +268,7 @@ namespace faultline
                         return false;
                     }
                     link_ids[lid] = true;
+                    connected_pairs[src + "->" + tgt] = true;
 
                     if (!node_ids.count(src))
                     {
@@ -281,7 +293,8 @@ namespace faultline
             if (scenario_json_.contains("workload") && scenario_json_["workload"].is_object())
             {
                 const auto &w = scenario_json_["workload"];
-                double rps = w.value("requests_per_second", 50.0);
+                // Support both canonical 'requests_per_second' and legacy 'arrival_rate_rps'
+                double rps = w.contains("requests_per_second") ? w.value("requests_per_second", 50.0) : w.value("arrival_rate_rps", 50.0);
                 if (rps <= 0.0 || rps > 100000.0)
                 {
                     std::cerr << "[Validation Error] requests_per_second must be between 0.1 and 100,000.\n";
@@ -303,6 +316,17 @@ namespace faultline
                             return false;
                         }
                     }
+
+                    // Strict topology validation: verify every adjacent route hop has a connecting link
+                    for (size_t i = 0; i + 1 < route.size(); i++)
+                    {
+                        std::string pair = route[i] + "->" + route[i + 1];
+                        if (!connected_pairs.count(pair))
+                        {
+                            std::cerr << "[Validation Error] No network link defined between route hop '" << route[i] << "' and '" << route[i + 1] << "'. Missing route links are not permitted.\n";
+                            return false;
+                        }
+                    }
                 }
                 if (w.contains("retry_policy") && w["retry_policy"].is_object())
                 {
@@ -320,10 +344,11 @@ namespace faultline
                 }
             }
 
-            // Chaos check
-            if (scenario_json_.contains("chaos") && scenario_json_["chaos"].is_array())
+            // Chaos check (supports canonical 'chaos' and legacy 'events')
+            const std::string chaos_key = scenario_json_.contains("chaos") ? "chaos" : (scenario_json_.contains("events") ? "events" : "");
+            if (!chaos_key.empty() && scenario_json_[chaos_key].is_array())
             {
-                for (const auto &c : scenario_json_["chaos"])
+                for (const auto &c : scenario_json_[chaos_key])
                 {
                     std::string type = c.value("type", "");
                     std::string target = c.value("target", "");
@@ -332,12 +357,12 @@ namespace faultline
                         std::cerr << "[Validation Error] Chaos event on target '" << target << "' must have duration_ms > 0.\n";
                         return false;
                     }
-                    if (type == "NODE_CRASH" && !node_ids.count(target))
+                    if ((type == "NODE_CRASH" || type == "CRASH_NODE") && !node_ids.count(target))
                     {
                         std::cerr << "[Validation Error] NODE_CRASH target node '" << target << "' does not exist.\n";
                         return false;
                     }
-                    if (type == "NETWORK_PARTITION" && !link_ids.count(target))
+                    if ((type == "NETWORK_PARTITION" || type == "PARTITION_LINK") && !link_ids.count(target))
                     {
                         std::cerr << "[Validation Error] NETWORK_PARTITION target link '" << target << "' does not exist.\n";
                         return false;
@@ -362,9 +387,10 @@ namespace faultline
             for (const auto &n : scenario_json_["nodes"])
             {
                 std::string id = n["id"];
-                size_t concurrency = n.value("concurrency", 4);
+                size_t concurrency = n.contains("concurrency") ? n.value("concurrency", 4) : n.value("workers", 4);
                 size_t queue_cap = n.value("queue_capacity", 20);
-                SimTime service_time_us = MS_TO_US(n.value("service_time_ms", 10ULL));
+                uint64_t svc_ms = n.contains("service_time_ms") ? n.value("service_time_ms", 10ULL) : n.value("processing_time_ms", 10ULL);
+                SimTime service_time_us = MS_TO_US(svc_ms);
 
                 nodes_[id] = std::make_unique<Node>(id, concurrency, queue_cap, service_time_us);
             }

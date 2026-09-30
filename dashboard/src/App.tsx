@@ -3,8 +3,11 @@ import {
   Activity, AlertCircle, AlertTriangle, CheckCircle2, ChevronRight, 
   Flame, Gauge, Info, Layers, Play, RefreshCw, RotateCcw, Server, 
   ShieldAlert, ShieldCheck, Terminal, Trophy, Zap, Sliders, HelpCircle,
-  Hash, ArrowUpRight
+  Hash, ArrowUpRight, XCircle
 } from 'lucide-react';
+
+const ORCHESTRATOR_URL = (import.meta as any).env?.VITE_ORCHESTRATOR_URL || 'http://localhost:8080';
+const ANALYTICS_URL = (import.meta as any).env?.VITE_ANALYTICS_URL || 'http://localhost:8000';
 
 interface ExperimentSummary {
   id: string;
@@ -38,22 +41,27 @@ interface AnalysisData {
 }
 
 interface ComparisonResult {
+  mode: string;
+  mode_label: string;
   comparison_summary: {
     strategy_a_name: string;
     strategy_b_name: string;
     winning_strategy: 'A' | 'B' | 'TIE';
     availability_improvement_pct: number;
     p95_latency_delta_ms: number;
+    trade_off_analysis: string;
   };
   strategy_a: {
     availability_percent: number;
     p95_latency_ms: number;
     failed_requests: number;
+    total_retries?: number;
   };
   strategy_b: {
     availability_percent: number;
     p95_latency_ms: number;
     failed_requests: number;
+    total_retries?: number;
   };
 }
 
@@ -70,8 +78,8 @@ export default function App() {
   const [analysis, setAnalysis] = useState<AnalysisData | null>(null);
   const [rawResults, setRawResults] = useState<any>(null);
 
-  // Run Lifecycle State
-  const [runState, setRunState] = useState<'idle' | 'running' | 'polling' | 'completed' | 'error'>('idle');
+  // Run Lifecycle State: strictly handles completed, failed, cancelled, timed_out
+  const [runState, setRunState] = useState<'idle' | 'running' | 'polling' | 'completed' | 'failed' | 'cancelled' | 'timed_out'>('idle');
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<'topology' | 'telemetry' | 'comparison'>('topology');
   const [showExplainer, setShowExplainer] = useState(false);
@@ -86,6 +94,7 @@ export default function App() {
   const [maxRetries, setMaxRetries] = useState<number>(2);
 
   // Dynamic A/B Comparison State
+  const [comparisonMode, setComparisonMode] = useState<'controlled_retry' | 'architecture_comparison'>('controlled_retry');
   const [comparisonData, setComparisonData] = useState<ComparisonResult | null>(null);
   const [isComparing, setIsComparing] = useState(false);
 
@@ -119,7 +128,7 @@ export default function App() {
   // Health checks: distinguishes service ping from actual C++ engine executable readiness
   const checkHealth = async () => {
     try {
-      const res = await fetch('http://localhost:8080/health');
+      const res = await fetch(`${ORCHESTRATOR_URL}/health`);
       if (res.ok) {
         const data = await res.json();
         setOrchestratorLive(true);
@@ -137,7 +146,7 @@ export default function App() {
     }
 
     try {
-      const res = await fetch('http://localhost:8000/health');
+      const res = await fetch(`${ANALYTICS_URL}/health`);
       setAnalyticsLive(res.ok);
     } catch {
       setAnalyticsLive(false);
@@ -147,12 +156,12 @@ export default function App() {
   // Fetch past experiments
   const fetchExperiments = async () => {
     try {
-      const res = await fetch('http://localhost:8080/api/v1/experiments');
+      const res = await fetch(`${ORCHESTRATOR_URL}/api/v1/experiments`);
       if (res.ok) {
         const data = await res.json();
         setExperiments(data.experiments || []);
         if (data.experiments && data.experiments.length > 0 && !selectedExpId) {
-          loadAnalysis(data.experiments[data.experiments.length - 1].id);
+          loadAnalysis(data.experiments[0].id);
         }
       }
     } catch (e) {
@@ -165,7 +174,7 @@ export default function App() {
     setSelectedExpId(expId);
     setErrorMessage(null);
     try {
-      const res = await fetch(`http://localhost:8000/api/v1/experiments/${expId}/analysis`);
+      const res = await fetch(`${ANALYTICS_URL}/api/v1/experiments/${expId}/analysis`);
       if (res.ok) {
         const data = await res.json();
         setAnalysis(data.analysis);
@@ -240,7 +249,7 @@ export default function App() {
         }
       };
 
-      const res = await fetch('http://localhost:8080/api/v1/experiments?wait=true', {
+      const res = await fetch(`${ORCHESTRATOR_URL}/api/v1/experiments?wait=true`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload)
@@ -251,7 +260,7 @@ export default function App() {
         throw new Error(`Orchestrator returned ${res.status}: ${err}`);
       }
 
-      const data = await res.json();
+      let data = await res.json();
       const expId = data.id;
 
       // Handle async 202 Accepted polling if not finished immediately
@@ -260,123 +269,235 @@ export default function App() {
         let finished = false;
         let attempts = 0;
         while (!finished && attempts < 30) {
-          await new Promise((r) => setTimeout(r, 200));
-          const check = await fetch(`http://localhost:8080/api/v1/experiments/${expId}`);
+          await new Promise((r) => setTimeout(r, 400));
+          const check = await fetch(`${ORCHESTRATOR_URL}/api/v1/experiments/${expId}`);
           if (check.ok) {
             const expData = await check.json();
-            if (expData.status === 'COMPLETED' || expData.status === 'FAILED') {
+            if (expData.status === 'COMPLETED' || expData.status === 'FAILED' || expData.status === 'CANCELLED') {
               finished = true;
+              data = expData;
               break;
             }
           }
           attempts++;
         }
+
+        if (!finished) {
+          setRunState('timed_out');
+          setErrorMessage('Simulation polling timed out after 12s. The experiment may still be running in the background.');
+          await fetchExperiments();
+          return;
+        }
       }
 
       await fetchExperiments();
-      await loadAnalysis(expId);
-      setRunState('completed');
+
+      if (data.status === 'FAILED') {
+        setRunState('failed');
+        setErrorMessage(data.error || 'Simulation engine execution reported failure.');
+        return;
+      }
+
+      if (data.status === 'CANCELLED') {
+        setRunState('cancelled');
+        setErrorMessage(data.error || 'Simulation run was cancelled.');
+        return;
+      }
+
+      if (data.status === 'COMPLETED') {
+        await loadAnalysis(expId);
+        setRunState('completed');
+      }
     } catch (err: any) {
       console.error("Simulation run error:", err);
       setErrorMessage(err.message || 'Simulation execution failed.');
-      setRunState('error');
+      setRunState('failed');
     }
   };
 
-  // Run dynamic A/B comparison between Strategy A (Naive) and Strategy B (Resilient)
+  // Run dynamic A/B comparison
   const runLiveComparison = async () => {
     setIsComparing(true);
     setErrorMessage(null);
     try {
-      // 1. Strategy A: Naive (Low concurrency, zero retries, fast queue exhaustion)
-      const payloadA = {
-        name: `Strategy A: Naive Baseline (${rps} RPS)`,
-        scenario: {
-          name: "Strategy A: Naive Baseline",
+      let expA: any;
+      let expB: any;
+
+      if (comparisonMode === 'controlled_retry') {
+        // Controlled Retry Experiment: ONLY retry_policy varies!
+        // Identical nodes, identical concurrency, identical queue capacities, identical links, identical seed, identical chaos schedule.
+        const sharedTopology = {
           seed: Number(seed) || 42,
           duration_ms: 1000,
           nodes: [
-            { id: "api-gateway", concurrency: 4, queue_capacity: 15, service_time_ms: 2 },
-            { id: "order-service", concurrency: 2, queue_capacity: 10, service_time_ms: 10 },
-            { id: "payment-service", concurrency: 1, queue_capacity: 5, service_time_ms: 25 }
+            { id: "api-gateway", concurrency: 6, queue_capacity: 30, service_time_ms: 2 },
+            { id: "order-service", concurrency: 4, queue_capacity: 20, service_time_ms: 10 },
+            { id: "payment-service", concurrency: 2, queue_capacity: 10, service_time_ms: 25 }
           ],
           links: [
             { id: "link-gw-order", source: "api-gateway", target: "order-service", latency_ms: 5, jitter_ms: 1, drop_rate: 0.0 },
             { id: "link-order-payment", source: "order-service", target: "payment-service", latency_ms: 10, jitter_ms: 2, drop_rate: 0.0 }
           ],
-          workload: {
-            requests_per_second: rps,
-            start_time_ms: 0,
-            duration_ms: 800,
-            route: ["api-gateway", "order-service", "payment-service"]
-          },
           chaos: [
             { time_ms: 300, type: "NODE_CRASH", target: "payment-service", duration_ms: 250 }
           ]
-        }
-      };
+        };
 
-      const resA = await fetch('http://localhost:8080/api/v1/experiments?wait=true', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payloadA)
-      });
-      if (!resA.ok) throw new Error("Strategy A execution failed on orchestrator.");
-      const expA = await resA.json();
-
-      // 2. Strategy B: Resilient (Optimized concurrency & bounded exponential retries)
-      const payloadB = {
-        name: `Strategy B: Resilient + Backoff (${rps} RPS)`,
-        scenario: {
-          name: "Strategy B: Resilient Architecture",
-          seed: Number(seed) || 42,
-          duration_ms: 1000,
-          nodes: [
-            { id: "api-gateway", concurrency: 8, queue_capacity: 50, service_time_ms: 2 },
-            { id: "order-service", concurrency: 4, queue_capacity: 25, service_time_ms: 10 },
-            { id: "payment-service", concurrency: 2, queue_capacity: 15, service_time_ms: 25 }
-          ],
-          links: [
-            { id: "link-gw-order", source: "api-gateway", target: "order-service", latency_ms: 5, jitter_ms: 1, drop_rate: 0.0 },
-            { id: "link-order-payment", source: "order-service", target: "payment-service", latency_ms: 10, jitter_ms: 2, drop_rate: 0.0 }
-          ],
-          workload: {
-            requests_per_second: rps,
-            start_time_ms: 0,
-            duration_ms: 800,
-            route: ["api-gateway", "order-service", "payment-service"],
-            retry_policy: {
-              max_retries: 2,
-              backoff_ms: 25,
-              backoff_multiplier: 1.5,
-              jitter_ms: 5
+        const payloadA = {
+          name: `Controlled: Strategy A (No Retries, ${rps} RPS)`,
+          scenario: {
+            ...sharedTopology,
+            name: "Strategy A: No Retries",
+            workload: {
+              requests_per_second: rps,
+              start_time_ms: 0,
+              duration_ms: 800,
+              route: ["api-gateway", "order-service", "payment-service"],
+              retry_policy: { max_retries: 0 }
             }
-          },
-          chaos: [
-            { time_ms: 300, type: "NODE_CRASH", target: "payment-service", duration_ms: 250 }
-          ]
-        }
-      };
+          }
+        };
 
-      const resB = await fetch('http://localhost:8080/api/v1/experiments?wait=true', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payloadB)
-      });
-      if (!resB.ok) throw new Error("Strategy B execution failed on orchestrator.");
-      const expB = await resB.json();
+        const payloadB = {
+          name: `Controlled: Strategy B (Bounded Backoff, ${rps} RPS)`,
+          scenario: {
+            ...sharedTopology,
+            name: "Strategy B: Bounded Backoff + Jitter",
+            workload: {
+              requests_per_second: rps,
+              start_time_ms: 0,
+              duration_ms: 800,
+              route: ["api-gateway", "order-service", "payment-service"],
+              retry_policy: {
+                max_retries: 2,
+                backoff_ms: 25,
+                backoff_multiplier: 1.5,
+                jitter_ms: 5
+              }
+            }
+          }
+        };
 
-      // 3. Call Python compare endpoint
-      const compRes = await fetch('http://localhost:8000/api/v1/compare', {
+        const resA = await fetch(`${ORCHESTRATOR_URL}/api/v1/experiments?wait=true`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payloadA)
+        });
+        if (!resA.ok) throw new Error("Strategy A run failed on orchestrator.");
+        expA = await resA.json();
+
+        const resB = await fetch(`${ORCHESTRATOR_URL}/api/v1/experiments?wait=true`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payloadB)
+        });
+        if (!resB.ok) throw new Error("Strategy B run failed on orchestrator.");
+        expB = await resB.json();
+
+      } else {
+        // Architecture Comparison Mode: Different architectural configurations
+        const payloadA = {
+          name: `Architecture: Strategy A Baseline (${rps} RPS)`,
+          scenario: {
+            name: "Strategy A: Naive Baseline",
+            seed: Number(seed) || 42,
+            duration_ms: 1000,
+            nodes: [
+              { id: "api-gateway", concurrency: 4, queue_capacity: 15, service_time_ms: 2 },
+              { id: "order-service", concurrency: 2, queue_capacity: 10, service_time_ms: 10 },
+              { id: "payment-service", concurrency: 1, queue_capacity: 5, service_time_ms: 25 }
+            ],
+            links: [
+              { id: "link-gw-order", source: "api-gateway", target: "order-service", latency_ms: 5, jitter_ms: 1, drop_rate: 0.0 },
+              { id: "link-order-payment", source: "order-service", target: "payment-service", latency_ms: 10, jitter_ms: 2, drop_rate: 0.0 }
+            ],
+            workload: {
+              requests_per_second: rps,
+              start_time_ms: 0,
+              duration_ms: 800,
+              route: ["api-gateway", "order-service", "payment-service"]
+            },
+            chaos: [
+              { time_ms: 300, type: "NODE_CRASH", target: "payment-service", duration_ms: 250 }
+            ]
+          }
+        };
+
+        const payloadB = {
+          name: `Architecture: Strategy B Resilient (${rps} RPS)`,
+          scenario: {
+            name: "Strategy B: Scaled & Resilient",
+            seed: Number(seed) || 42,
+            duration_ms: 1000,
+            nodes: [
+              { id: "api-gateway", concurrency: 8, queue_capacity: 50, service_time_ms: 2 },
+              { id: "order-service", concurrency: 4, queue_capacity: 25, service_time_ms: 10 },
+              { id: "payment-service", concurrency: 2, queue_capacity: 15, service_time_ms: 25 }
+            ],
+            links: [
+              { id: "link-gw-order", source: "api-gateway", target: "order-service", latency_ms: 5, jitter_ms: 1, drop_rate: 0.0 },
+              { id: "link-order-payment", source: "order-service", target: "payment-service", latency_ms: 10, jitter_ms: 2, drop_rate: 0.0 }
+            ],
+            workload: {
+              requests_per_second: rps,
+              start_time_ms: 0,
+              duration_ms: 800,
+              route: ["api-gateway", "order-service", "payment-service"],
+              retry_policy: {
+                max_retries: 2,
+                backoff_ms: 25,
+                backoff_multiplier: 1.5,
+                jitter_ms: 5
+              }
+            },
+            chaos: [
+              { time_ms: 300, type: "NODE_CRASH", target: "payment-service", duration_ms: 250 }
+            ]
+          }
+        };
+
+        const resA = await fetch(`${ORCHESTRATOR_URL}/api/v1/experiments?wait=true`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payloadA)
+        });
+        if (!resA.ok) throw new Error("Strategy A run failed on orchestrator.");
+        expA = await resA.json();
+
+        const resB = await fetch(`${ORCHESTRATOR_URL}/api/v1/experiments?wait=true`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payloadB)
+        });
+        if (!resB.ok) throw new Error("Strategy B run failed on orchestrator.");
+        expB = await resB.json();
+      }
+
+      if (expA.status !== 'COMPLETED') {
+        throw new Error(`Strategy A failed: ${expA.error || expA.status}`);
+      }
+      if (expB.status !== 'COMPLETED') {
+        throw new Error(`Strategy B failed: ${expB.error || expB.status}`);
+      }
+
+      const resultsA = typeof expA.results === 'string' ? JSON.parse(expA.results) : expA.results;
+      const resultsB = typeof expB.results === 'string' ? JSON.parse(expB.results) : expB.results;
+
+      const compRes = await fetch(`${ANALYTICS_URL}/api/v1/compare`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          experiment_a: expA.results,
-          experiment_b: expB.results
+          experiment_a: resultsA,
+          experiment_b: resultsB,
+          mode: comparisonMode
         })
       });
 
-      if (!compRes.ok) throw new Error("Failed to calculate statistical comparison in FastAPI.");
+      if (!compRes.ok) {
+        const err = await compRes.text();
+        throw new Error(`Analytics compare returned ${compRes.status}: ${err}`);
+      }
+
       const compData = await compRes.json();
       setComparisonData(compData);
       await fetchExperiments();
@@ -1090,67 +1211,108 @@ export default function App() {
             <div className="flex flex-col gap-5">
               
               {/* Header Action Bar */}
-              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 p-4 rounded-xl bg-slate-900/50 border border-white/5">
-                <div>
-                  <h3 className="text-xs font-bold uppercase tracking-wider text-white flex items-center gap-2">
-                    <Trophy className="w-4 h-4 text-amber-400" />
-                    <span>Live A/B Strategy Benchmark</span>
-                  </h3>
-                  <p className="text-xs text-slate-400 mt-0.5">
-                    Execute Strategy A (Naive) vs Strategy B (Resilient Backoff) under identical chaos conditions to measure empirical improvement.
-                  </p>
+              <div className="flex flex-col gap-4 p-4 rounded-xl bg-slate-900/50 border border-white/5">
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+                  <div>
+                    <h3 className="text-xs font-bold uppercase tracking-wider text-white flex items-center gap-2">
+                      <Trophy className="w-4 h-4 text-amber-400" />
+                      <span>Scientific A/B Strategy Benchmark</span>
+                    </h3>
+                    <p className="text-xs text-slate-400 mt-0.5">
+                      Evaluate resilience mitigations against a naive baseline under identical seed ({seed}) and fault schedules.
+                    </p>
+                  </div>
+
+                  <button
+                    onClick={runLiveComparison}
+                    disabled={isComparing || !orchestratorLive || !analyticsLive}
+                    className={`px-4 py-2 rounded-lg text-xs font-bold flex items-center gap-2 shadow-lg transition-all ${
+                      isComparing 
+                        ? 'bg-slate-700 text-slate-400 cursor-not-allowed'
+                        : 'bg-sky-600 hover:bg-sky-500 text-white shadow-sky-600/20 active:scale-95'
+                    }`}
+                  >
+                    {isComparing ? (
+                      <>
+                        <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                        <span>Benchmarking Both Strategies...</span>
+                      </>
+                    ) : (
+                      <>
+                        <Play className="w-3.5 h-3.5 fill-current" />
+                        <span>Run Live A/B Benchmark</span>
+                      </>
+                    )}
+                  </button>
                 </div>
 
-                <button
-                  onClick={runLiveComparison}
-                  disabled={isComparing || !orchestratorLive || !analyticsLive}
-                  className={`px-4 py-2 rounded-lg text-xs font-bold flex items-center gap-2 shadow-lg transition-all ${
-                    isComparing 
-                      ? 'bg-slate-700 text-slate-400 cursor-not-allowed'
-                      : 'bg-sky-600 hover:bg-sky-500 text-white shadow-sky-600/20 active:scale-95'
-                  }`}
-                >
-                  {isComparing ? (
-                    <>
-                      <RefreshCw className="w-3.5 h-3.5 animate-spin" />
-                      <span>Benchmarking Both Strategies...</span>
-                    </>
-                  ) : (
-                    <>
-                      <Play className="w-3.5 h-3.5 fill-current" />
-                      <span>Run Live A/B Benchmark</span>
-                    </>
-                  )}
-                </button>
+                {/* Comparison Mode Selector */}
+                <div className="flex items-center gap-3 pt-3 border-t border-white/5">
+                  <span className="text-[11px] font-bold uppercase tracking-wider text-slate-400">Mode:</span>
+                  <div className="flex gap-2">
+                    <button
+                      onClick={() => setComparisonMode('controlled_retry')}
+                      className={`text-xs px-3 py-1 rounded-lg font-medium transition-all ${
+                        comparisonMode === 'controlled_retry'
+                          ? 'bg-sky-500/20 text-sky-300 border border-sky-500/40 font-bold'
+                          : 'bg-slate-800/60 text-slate-400 hover:text-white border border-white/5'
+                      }`}
+                    >
+                      🎯 Controlled Retry Test (Only Retries Vary)
+                    </button>
+                    <button
+                      onClick={() => setComparisonMode('architecture_comparison')}
+                      className={`text-xs px-3 py-1 rounded-lg font-medium transition-all ${
+                        comparisonMode === 'architecture_comparison'
+                          ? 'bg-purple-500/20 text-purple-300 border border-purple-500/40 font-bold'
+                          : 'bg-slate-800/60 text-slate-400 hover:text-white border border-white/5'
+                      }`}
+                    >
+                      🏗️ Full Architecture Comparison (Concurrency + Queues)
+                    </button>
+                  </div>
+                </div>
               </div>
 
               {/* Dynamic Comparison Results or Empty State */}
               {comparisonData ? (
                 <div className="flex flex-col gap-4">
                   {/* Winner Banner */}
-                  <div className="bg-sky-950/20 border border-sky-500/30 p-4 rounded-xl flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-                    <div className="flex items-center gap-3">
-                      <div className="w-9 h-9 rounded-lg bg-amber-500/20 flex items-center justify-center flex-shrink-0">
-                        <Trophy className="w-5 h-5 text-amber-400" />
+                  <div className="bg-sky-950/20 border border-sky-500/30 p-4 rounded-xl flex flex-col gap-3">
+                    <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+                      <div className="flex items-center gap-3">
+                        <div className="w-9 h-9 rounded-lg bg-amber-500/20 flex items-center justify-center flex-shrink-0">
+                          <Trophy className="w-5 h-5 text-amber-400" />
+                        </div>
+                        <div>
+                          <div className="flex items-center gap-2">
+                            <h4 className="text-xs font-bold text-white">
+                              Winner: Strategy {comparisonData.comparison_summary.winning_strategy}
+                            </h4>
+                            <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-sky-500/20 text-sky-300 border border-sky-500/30">
+                              {comparisonData.mode_label}
+                            </span>
+                          </div>
+                          <p className="text-[11px] text-slate-400 mt-0.5">
+                            {comparisonData.comparison_summary.trade_off_analysis}
+                          </p>
+                        </div>
                       </div>
-                      <div>
-                        <h4 className="text-xs font-bold text-white">
-                          Winner: Strategy {comparisonData.comparison_summary.winning_strategy}
-                        </h4>
-                        <p className="text-[11px] text-slate-400">
-                          Evaluated by Python FastAPI statistical engine under identical seed ({seed}) and fault conditions.
-                        </p>
+
+                      <div className="flex items-center gap-2">
+                        <span className="text-xs font-bold font-mono px-3 py-1 rounded-full bg-emerald-500/20 text-emerald-300 border border-emerald-500/30">
+                          {comparisonData.comparison_summary.availability_improvement_pct >= 0 ? '+' : ''}
+                          {comparisonData.comparison_summary.availability_improvement_pct}% Uptime
+                        </span>
+                        <span className="text-xs font-bold font-mono px-3 py-1 rounded-full bg-sky-500/20 text-sky-300 border border-sky-500/30">
+                          {comparisonData.comparison_summary.p95_latency_delta_ms.toFixed(1)}ms p95 Delta
+                        </span>
                       </div>
                     </div>
 
-                    <div className="flex items-center gap-2">
-                      <span className="text-xs font-bold font-mono px-3 py-1 rounded-full bg-emerald-500/20 text-emerald-300 border border-emerald-500/30">
-                        {comparisonData.comparison_summary.availability_improvement_pct >= 0 ? '+' : ''}
-                        {comparisonData.comparison_summary.availability_improvement_pct}% Uptime
-                      </span>
-                      <span className="text-xs font-bold font-mono px-3 py-1 rounded-full bg-sky-500/20 text-sky-300 border border-sky-500/30">
-                        {comparisonData.comparison_summary.p95_latency_delta_ms.toFixed(1)}ms p95 Delta
-                      </span>
+                    <div className="text-[10px] text-slate-500 pt-2 border-t border-white/5 flex items-center justify-between">
+                      <span>Note on Sign Convention: Negative p95 delta (-ms) indicates Strategy B is faster / reduced tail latency.</span>
+                      <span className="font-mono">Seed: {seed}</span>
                     </div>
                   </div>
 
@@ -1160,7 +1322,9 @@ export default function App() {
                     {/* Strategy A */}
                     <div className="bg-[#070b14] border border-rose-500/20 rounded-xl p-5 flex flex-col gap-3">
                       <div className="flex items-center justify-between">
-                        <span className="text-xs font-bold text-rose-400">Strategy A: Baseline (Naive)</span>
+                        <span className="text-xs font-bold text-rose-400">
+                          {comparisonData.comparison_summary.strategy_a_name}
+                        </span>
                         <span className="text-[10px] font-bold px-2 py-0.5 rounded bg-rose-500/10 text-rose-400">BASELINE</span>
                       </div>
 
@@ -1177,24 +1341,28 @@ export default function App() {
                             {comparisonData.strategy_a.p95_latency_ms.toFixed(1)} ms
                           </span>
                         </div>
-                        <div className="flex justify-between py-1">
+                        <div className="flex justify-between py-1 border-b border-white/5">
                           <span className="text-slate-400">Requests Dropped:</span>
                           <span className="font-mono font-bold text-rose-400">
                             {comparisonData.strategy_a.failed_requests} requests
                           </span>
                         </div>
+                        <div className="flex justify-between py-1">
+                          <span className="text-slate-400">Retry Attempts:</span>
+                          <span className="font-mono font-bold text-slate-300">
+                            {comparisonData.strategy_a.total_retries ?? 0}
+                          </span>
+                        </div>
                       </div>
-
-                      <p className="text-[11px] text-slate-500 mt-2 border-t border-white/5 pt-2">
-                        Zero retries and lower queue concurrency, leading to early dropouts during node outages.
-                      </p>
                     </div>
 
                     {/* Strategy B */}
                     <div className="bg-[#070b14] border border-emerald-500/30 rounded-xl p-5 flex flex-col gap-3 shadow-lg shadow-emerald-950/20">
                       <div className="flex items-center justify-between">
-                        <span className="text-xs font-bold text-emerald-400">Strategy B: Resilient Architecture</span>
-                        <span className="text-[10px] font-bold px-2 py-0.5 rounded bg-emerald-500/20 text-emerald-300 font-bold">RECOMMENDED</span>
+                        <span className="text-xs font-bold text-emerald-400">
+                          {comparisonData.comparison_summary.strategy_b_name}
+                        </span>
+                        <span className="text-[10px] font-bold px-2 py-0.5 rounded bg-emerald-500/20 text-emerald-300 font-bold">MITIGATION</span>
                       </div>
 
                       <div className="space-y-2 text-xs">
@@ -1210,17 +1378,19 @@ export default function App() {
                             {comparisonData.strategy_b.p95_latency_ms.toFixed(1)} ms
                           </span>
                         </div>
-                        <div className="flex justify-between py-1">
+                        <div className="flex justify-between py-1 border-b border-white/5">
                           <span className="text-slate-400">Requests Dropped:</span>
                           <span className="font-mono font-bold text-emerald-400">
                             {comparisonData.strategy_b.failed_requests} requests
                           </span>
                         </div>
+                        <div className="flex justify-between py-1">
+                          <span className="text-slate-400">Retry Attempts:</span>
+                          <span className="font-mono font-bold text-slate-300">
+                            {comparisonData.strategy_b.total_retries ?? 0}
+                          </span>
+                        </div>
                       </div>
-
-                      <p className="text-[11px] text-slate-400 mt-2 border-t border-white/5 pt-2">
-                        Bounded retries with backoff and increased worker concurrency protect uptime during the crash window.
-                      </p>
                     </div>
 
                   </div>
@@ -1232,7 +1402,7 @@ export default function App() {
                   </div>
                   <h4 className="text-sm font-bold text-white">No Comparison Run Executed Yet</h4>
                   <p className="text-xs text-slate-400 max-w-md">
-                    Click <strong>"Run Live A/B Benchmark"</strong> above. Faultline will dispatch Strategy A and Strategy B into the engine with the exact same workload and seed, then invoke the Python comparison service to compute real uptime and latency deltas.
+                    Select a mode above and click <strong>"Run Live A/B Benchmark"</strong>. Faultline will dispatch Strategy A and Strategy B into the engine with the exact same workload and seed, then invoke the Python comparison service to compute empirical availability and tail latency deltas.
                   </p>
                 </div>
               )}
@@ -1264,7 +1434,15 @@ export default function App() {
                 }`}
               >
                 <div className="flex items-center gap-3">
-                  <CheckCircle2 className="w-4 h-4 text-emerald-400" />
+                  {exp.status === 'COMPLETED' ? (
+                    <CheckCircle2 className="w-4 h-4 text-emerald-400" />
+                  ) : exp.status === 'FAILED' ? (
+                    <XCircle className="w-4 h-4 text-rose-400" />
+                  ) : exp.status === 'CANCELLED' ? (
+                    <AlertCircle className="w-4 h-4 text-amber-400" />
+                  ) : (
+                    <RefreshCw className="w-4 h-4 text-sky-400 animate-spin" />
+                  )}
                   <div>
                     <span className="text-xs font-bold text-white block">{exp.name}</span>
                     <span className="text-[10px] text-slate-500 font-mono">{exp.id}</span>
@@ -1273,7 +1451,15 @@ export default function App() {
 
                 <div className="flex items-center gap-4 text-xs font-mono">
                   <span className="text-slate-400">{exp.duration_ms ? `${exp.duration_ms.toFixed(1)} ms` : '—'}</span>
-                  <span className="text-[10px] font-bold px-2 py-0.5 rounded bg-emerald-500/20 text-emerald-300">
+                  <span className={`text-[10px] font-bold px-2 py-0.5 rounded ${
+                    exp.status === 'COMPLETED'
+                      ? 'bg-emerald-500/20 text-emerald-300'
+                      : exp.status === 'FAILED'
+                      ? 'bg-rose-500/20 text-rose-300'
+                      : exp.status === 'CANCELLED'
+                      ? 'bg-amber-500/20 text-amber-300'
+                      : 'bg-sky-500/20 text-sky-300'
+                  }`}>
                     {exp.status}
                   </span>
                   <ChevronRight className="w-3.5 h-3.5 text-slate-600" />
