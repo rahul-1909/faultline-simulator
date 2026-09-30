@@ -1,8 +1,9 @@
 import React, { useState, useEffect } from 'react';
 import { 
-  Activity, AlertTriangle, ArrowRight, CheckCircle2, ChevronRight, 
-  Cpu, Database, Flame, Gauge, Info, Layers, Play, RefreshCw, Server, 
-  ShieldAlert, ShieldCheck, Sparkles, Terminal, Trophy, Wifi, WifiOff, XCircle, Zap, Sliders, HelpCircle
+  Activity, AlertCircle, AlertTriangle, CheckCircle2, ChevronRight, 
+  Flame, Gauge, Info, Layers, Play, RefreshCw, RotateCcw, Server, 
+  ShieldAlert, ShieldCheck, Terminal, Trophy, Zap, Sliders, HelpCircle,
+  Hash, ArrowUpRight
 } from 'lucide-react';
 
 interface ExperimentSummary {
@@ -36,52 +37,103 @@ interface AnalysisData {
   failure_attribution: Record<string, number>;
 }
 
+interface ComparisonResult {
+  comparison_summary: {
+    strategy_a_name: string;
+    strategy_b_name: string;
+    winning_strategy: 'A' | 'B' | 'TIE';
+    availability_improvement_pct: number;
+    p95_latency_delta_ms: number;
+  };
+  strategy_a: {
+    availability_percent: number;
+    p95_latency_ms: number;
+    failed_requests: number;
+  };
+  strategy_b: {
+    availability_percent: number;
+    p95_latency_ms: number;
+    failed_requests: number;
+  };
+}
+
 export default function App() {
+  // Service Health & Execution Readiness
   const [orchestratorLive, setOrchestratorLive] = useState(false);
+  const [engineReady, setEngineReady] = useState(false);
+  const [engineStatus, setEngineStatus] = useState<string>('checking');
   const [analyticsLive, setAnalyticsLive] = useState(false);
+
+  // Experiment & Diagnostics State
   const [experiments, setExperiments] = useState<ExperimentSummary[]>([]);
   const [selectedExpId, setSelectedExpId] = useState<string | null>(null);
   const [analysis, setAnalysis] = useState<AnalysisData | null>(null);
   const [rawResults, setRawResults] = useState<any>(null);
-  const [isRunning, setIsRunning] = useState(false);
+
+  // Run Lifecycle State
+  const [runState, setRunState] = useState<'idle' | 'running' | 'polling' | 'completed' | 'error'>('idle');
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<'topology' | 'telemetry' | 'comparison'>('topology');
   const [showExplainer, setShowExplainer] = useState(false);
 
-  // Chaos Experiment Controls
+  // Chaos Experiment Configuration
   const [preset, setPreset] = useState<'outage' | 'retry_storm' | 'partition_only' | 'healthy'>('outage');
   const [rps, setRps] = useState<number>(80);
+  const [seed, setSeed] = useState<number>(42);
   const [crashPayment, setCrashPayment] = useState<boolean>(true);
   const [cutNetwork, setCutNetwork] = useState<boolean>(true);
+  const [enableRetries, setEnableRetries] = useState<boolean>(false);
+  const [maxRetries, setMaxRetries] = useState<number>(2);
 
-  // Update controls when preset changes
+  // Dynamic A/B Comparison State
+  const [comparisonData, setComparisonData] = useState<ComparisonResult | null>(null);
+  const [isComparing, setIsComparing] = useState(false);
+
+  // Preset switching logic
   const handlePresetChange = (newPreset: 'outage' | 'retry_storm' | 'partition_only' | 'healthy') => {
     setPreset(newPreset);
     if (newPreset === 'outage') {
       setRps(80);
       setCrashPayment(true);
       setCutNetwork(true);
+      setEnableRetries(false);
     } else if (newPreset === 'retry_storm') {
-      setRps(140);
+      setRps(120);
       setCrashPayment(true);
       setCutNetwork(false);
+      setEnableRetries(true);
+      setMaxRetries(3);
     } else if (newPreset === 'partition_only') {
       setRps(80);
       setCrashPayment(false);
       setCutNetwork(true);
+      setEnableRetries(false);
     } else if (newPreset === 'healthy') {
       setRps(60);
       setCrashPayment(false);
       setCutNetwork(false);
+      setEnableRetries(false);
     }
   };
 
-  // Check backend health
+  // Health checks: distinguishes service ping from actual C++ engine executable readiness
   const checkHealth = async () => {
     try {
       const res = await fetch('http://localhost:8080/health');
-      setOrchestratorLive(res.ok);
+      if (res.ok) {
+        const data = await res.json();
+        setOrchestratorLive(true);
+        setEngineReady(Boolean(data.engine_ready));
+        setEngineStatus(data.engine_status || (data.engine_ready ? 'ready' : 'unavailable'));
+      } else {
+        setOrchestratorLive(false);
+        setEngineReady(false);
+        setEngineStatus('unreachable');
+      }
     } catch {
       setOrchestratorLive(false);
+      setEngineReady(false);
+      setEngineStatus('offline');
     }
 
     try {
@@ -92,7 +144,7 @@ export default function App() {
     }
   };
 
-  // Fetch experiments list
+  // Fetch past experiments
   const fetchExperiments = async () => {
     try {
       const res = await fetch('http://localhost:8080/api/v1/experiments');
@@ -108,24 +160,31 @@ export default function App() {
     }
   };
 
-  // Load deep analysis from FastAPI
+  // Load analysis for a specific experiment
   const loadAnalysis = async (expId: string) => {
     setSelectedExpId(expId);
+    setErrorMessage(null);
     try {
       const res = await fetch(`http://localhost:8000/api/v1/experiments/${expId}/analysis`);
       if (res.ok) {
         const data = await res.json();
         setAnalysis(data.analysis);
         setRawResults(data.raw_results);
+      } else {
+        const errText = await res.text();
+        setErrorMessage(`Analytics lookup failed (${res.status}): ${errText}`);
       }
-    } catch (e) {
+    } catch (e: any) {
       console.error("Error fetching analysis:", e);
+      setErrorMessage(`Cannot reach analytics service: ${e.message}`);
     }
   };
 
-  // Trigger dynamic simulation run
+  // Trigger simulation run with polling for async completion
   const triggerSimulation = async () => {
-    setIsRunning(true);
+    setRunState('running');
+    setErrorMessage(null);
+
     try {
       const chaosEvents: any[] = [];
       if (crashPayment) {
@@ -145,16 +204,101 @@ export default function App() {
         });
       }
 
+      const workload: any = {
+        requests_per_second: rps,
+        start_time_ms: 0,
+        duration_ms: 800,
+        route: ["api-gateway", "order-service", "payment-service"]
+      };
+
+      if (enableRetries && maxRetries > 0) {
+        workload.retry_policy = {
+          max_retries: maxRetries,
+          backoff_ms: 25,
+          backoff_multiplier: 1.5,
+          jitter_ms: 5
+        };
+      }
+
       const payload = {
-        name: `${preset === 'healthy' ? 'Healthy Baseline' : preset === 'retry_storm' ? 'Retry Storm' : 'Black Friday Outage'} (${rps} RPS)`,
+        name: `${preset === 'healthy' ? 'Healthy Baseline' : preset === 'retry_storm' ? 'Retry Storm Outage' : 'Black Friday Outage'} (${rps} RPS, Seed ${seed})`,
         scenario: {
           name: `Simulation (${rps} RPS)`,
-          seed: Math.floor(Math.random() * 1000),
+          seed: Number(seed) || 42,
           duration_ms: 1000,
           nodes: [
             { id: "api-gateway", concurrency: 8, queue_capacity: 50, service_time_ms: 2 },
             { id: "order-service", concurrency: 4, queue_capacity: 20, service_time_ms: 10 },
             { id: "payment-service", concurrency: 2, queue_capacity: 10, service_time_ms: 25 }
+          ],
+          links: [
+            { id: "link-gw-order", source: "api-gateway", target: "order-service", latency_ms: 5, jitter_ms: 1, drop_rate: 0.0 },
+            { id: "link-order-payment", source: "order-service", target: "payment-service", latency_ms: 10, jitter_ms: 2, drop_rate: 0.0 }
+          ],
+          workload,
+          chaos: chaosEvents
+        }
+      };
+
+      const res = await fetch('http://localhost:8080/api/v1/experiments?wait=true', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+
+      if (!res.ok) {
+        const err = await res.text();
+        throw new Error(`Orchestrator returned ${res.status}: ${err}`);
+      }
+
+      const data = await res.json();
+      const expId = data.id;
+
+      // Handle async 202 Accepted polling if not finished immediately
+      if (res.status === 202 || data.status === 'RUNNING' || data.status === 'QUEUED') {
+        setRunState('polling');
+        let finished = false;
+        let attempts = 0;
+        while (!finished && attempts < 30) {
+          await new Promise((r) => setTimeout(r, 200));
+          const check = await fetch(`http://localhost:8080/api/v1/experiments/${expId}`);
+          if (check.ok) {
+            const expData = await check.json();
+            if (expData.status === 'COMPLETED' || expData.status === 'FAILED') {
+              finished = true;
+              break;
+            }
+          }
+          attempts++;
+        }
+      }
+
+      await fetchExperiments();
+      await loadAnalysis(expId);
+      setRunState('completed');
+    } catch (err: any) {
+      console.error("Simulation run error:", err);
+      setErrorMessage(err.message || 'Simulation execution failed.');
+      setRunState('error');
+    }
+  };
+
+  // Run dynamic A/B comparison between Strategy A (Naive) and Strategy B (Resilient)
+  const runLiveComparison = async () => {
+    setIsComparing(true);
+    setErrorMessage(null);
+    try {
+      // 1. Strategy A: Naive (Low concurrency, zero retries, fast queue exhaustion)
+      const payloadA = {
+        name: `Strategy A: Naive Baseline (${rps} RPS)`,
+        scenario: {
+          name: "Strategy A: Naive Baseline",
+          seed: Number(seed) || 42,
+          duration_ms: 1000,
+          nodes: [
+            { id: "api-gateway", concurrency: 4, queue_capacity: 15, service_time_ms: 2 },
+            { id: "order-service", concurrency: 2, queue_capacity: 10, service_time_ms: 10 },
+            { id: "payment-service", concurrency: 1, queue_capacity: 5, service_time_ms: 25 }
           ],
           links: [
             { id: "link-gw-order", source: "api-gateway", target: "order-service", latency_ms: 5, jitter_ms: 1, drop_rate: 0.0 },
@@ -166,25 +310,81 @@ export default function App() {
             duration_ms: 800,
             route: ["api-gateway", "order-service", "payment-service"]
           },
-          chaos: chaosEvents
+          chaos: [
+            { time_ms: 300, type: "NODE_CRASH", target: "payment-service", duration_ms: 250 }
+          ]
         }
       };
 
-      const res = await fetch('http://localhost:8080/api/v1/experiments?wait=true', {
+      const resA = await fetch('http://localhost:8080/api/v1/experiments?wait=true', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
+        body: JSON.stringify(payloadA)
+      });
+      if (!resA.ok) throw new Error("Strategy A execution failed on orchestrator.");
+      const expA = await resA.json();
+
+      // 2. Strategy B: Resilient (Optimized concurrency & bounded exponential retries)
+      const payloadB = {
+        name: `Strategy B: Resilient + Backoff (${rps} RPS)`,
+        scenario: {
+          name: "Strategy B: Resilient Architecture",
+          seed: Number(seed) || 42,
+          duration_ms: 1000,
+          nodes: [
+            { id: "api-gateway", concurrency: 8, queue_capacity: 50, service_time_ms: 2 },
+            { id: "order-service", concurrency: 4, queue_capacity: 25, service_time_ms: 10 },
+            { id: "payment-service", concurrency: 2, queue_capacity: 15, service_time_ms: 25 }
+          ],
+          links: [
+            { id: "link-gw-order", source: "api-gateway", target: "order-service", latency_ms: 5, jitter_ms: 1, drop_rate: 0.0 },
+            { id: "link-order-payment", source: "order-service", target: "payment-service", latency_ms: 10, jitter_ms: 2, drop_rate: 0.0 }
+          ],
+          workload: {
+            requests_per_second: rps,
+            start_time_ms: 0,
+            duration_ms: 800,
+            route: ["api-gateway", "order-service", "payment-service"],
+            retry_policy: {
+              max_retries: 2,
+              backoff_ms: 25,
+              backoff_multiplier: 1.5,
+              jitter_ms: 5
+            }
+          },
+          chaos: [
+            { time_ms: 300, type: "NODE_CRASH", target: "payment-service", duration_ms: 250 }
+          ]
+        }
+      };
+
+      const resB = await fetch('http://localhost:8080/api/v1/experiments?wait=true', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payloadB)
+      });
+      if (!resB.ok) throw new Error("Strategy B execution failed on orchestrator.");
+      const expB = await resB.json();
+
+      // 3. Call Python compare endpoint
+      const compRes = await fetch('http://localhost:8000/api/v1/compare', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          experiment_a: expA.results,
+          experiment_b: expB.results
+        })
       });
 
-      if (res.ok) {
-        const data = await res.json();
-        await fetchExperiments();
-        await loadAnalysis(data.id);
-      }
-    } catch (err) {
-      console.error("Simulation run failed:", err);
+      if (!compRes.ok) throw new Error("Failed to calculate statistical comparison in FastAPI.");
+      const compData = await compRes.json();
+      setComparisonData(compData);
+      await fetchExperiments();
+    } catch (e: any) {
+      console.error("Comparison error:", e);
+      setErrorMessage(e.message || "Failed to execute A/B strategy benchmark.");
     } finally {
-      setIsRunning(false);
+      setIsComparing(false);
     }
   };
 
@@ -195,10 +395,48 @@ export default function App() {
     return () => clearInterval(interval);
   }, []);
 
+  // Compute incident assessment from actual results
+  const renderIncidentAssessment = () => {
+    if (!analysis) return null;
+    const avail = analysis.availability_percent;
+    const drops = analysis.failed_requests;
+    const total = analysis.total_requests;
+    const culprit = analysis.bottleneck_diagnosis.primary_bottleneck_node || 'link-order-payment';
+    const cause = analysis.bottleneck_diagnosis.primary_failure_cause || 'NONE';
+
+    if (avail === 100) {
+      return {
+        title: "System Healthy: Normal Operations",
+        sev: "SEV-4 HEALTHY",
+        badgeStyle: "bg-emerald-500/20 text-emerald-400 border border-emerald-500/30",
+        icon: <ShieldCheck className="w-5 h-5 text-emerald-400" />,
+        description: `100% of ${total} requests fulfilled across all hops with 0 drops and zero queue backpressure.`
+      };
+    } else if (avail >= 90) {
+      return {
+        title: `Partial Degradation: ${avail}% Uptime (${drops} Dropped)`,
+        sev: "SEV-3 MODERATE",
+        badgeStyle: "bg-amber-500/20 text-amber-300 border border-amber-500/30",
+        icon: <AlertTriangle className="w-5 h-5 text-amber-400" />,
+        description: `${drops} of ${total} requests failed. Primary bottleneck: ${culprit} (${cause}). System absorbed most load successfully.`
+      };
+    } else {
+      return {
+        title: `Major Incident: Outage on ${culprit} (${avail}% Availability)`,
+        sev: "SEV-1 CRITICAL",
+        badgeStyle: "bg-rose-500/20 text-rose-300 border border-rose-500/30",
+        icon: <AlertCircle className="w-5 h-5 text-rose-400" />,
+        description: `Severe failure: ${drops} of ${total} requests dropped (${(100 - avail).toFixed(1)}% drop rate). Cause: ${cause}.`
+      };
+    }
+  };
+
+  const incident = renderIncidentAssessment();
+
   return (
     <div className="min-h-screen bg-[#070b14] text-slate-200 flex flex-col font-sans selection:bg-rose-500 selection:text-white">
       
-      {/* Top Navigation Bar */}
+      {/* Navigation Header */}
       <header className="border-b border-white/10 bg-[#0d131f]/90 backdrop-blur-md px-6 py-3.5 flex items-center justify-between sticky top-0 z-50">
         <div className="flex items-center gap-4">
           <div className="w-9 h-9 rounded-lg bg-gradient-to-tr from-rose-600 to-rose-400 flex items-center justify-center shadow-lg shadow-rose-600/30">
@@ -208,7 +446,7 @@ export default function App() {
             <div className="flex items-center gap-2">
               <span className="text-lg font-extrabold tracking-tight text-white font-mono">FAULTLINE</span>
               <span className="text-[10px] uppercase font-bold tracking-wider px-2 py-0.5 rounded-full bg-rose-500/10 text-rose-400 border border-rose-500/20">
-                DES CHAOS SIMULATOR
+                DISTRIBUTED DES ENGINE
               </span>
             </div>
             <p className="text-xs text-slate-400 hidden sm:block">
@@ -217,7 +455,7 @@ export default function App() {
           </div>
         </div>
 
-        {/* System Health Status Pills & Explainer Toggle */}
+        {/* Real System Health Checks */}
         <div className="flex items-center gap-3">
           <button 
             onClick={() => setShowExplainer(!showExplainer)}
@@ -227,12 +465,16 @@ export default function App() {
             <span className="hidden md:inline">How It Works</span>
           </button>
 
+          {/* C++ Engine Verified Execution Check */}
           <div className="hidden lg:flex items-center gap-2 text-xs bg-slate-900/60 px-3 py-1.5 rounded-lg border border-white/5">
-            <div className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></div>
+            <div className={`w-2 h-2 rounded-full ${engineReady ? 'bg-emerald-400 animate-pulse' : 'bg-rose-500'}`}></div>
             <span className="text-slate-400">C++ Engine:</span>
-            <span className="text-emerald-400 font-semibold font-mono">Ready</span>
+            <span className={`font-semibold font-mono ${engineReady ? 'text-emerald-400' : 'text-rose-400'}`}>
+              {engineReady ? 'Ready' : engineStatus}
+            </span>
           </div>
 
+          {/* Go Orchestrator Health */}
           <div className="hidden lg:flex items-center gap-2 text-xs bg-slate-900/60 px-3 py-1.5 rounded-lg border border-white/5">
             <div className={`w-2 h-2 rounded-full ${orchestratorLive ? 'bg-emerald-400 animate-pulse' : 'bg-rose-500'}`}></div>
             <span className="text-slate-400">Go Orchestrator:</span>
@@ -241,6 +483,7 @@ export default function App() {
             </span>
           </div>
 
+          {/* FastAPI Analytics Health */}
           <div className="hidden lg:flex items-center gap-2 text-xs bg-slate-900/60 px-3 py-1.5 rounded-lg border border-white/5">
             <div className={`w-2 h-2 rounded-full ${analyticsLive ? 'bg-emerald-400 animate-pulse' : 'bg-rose-500'}`}></div>
             <span className="text-slate-400">FastAPI:</span>
@@ -251,17 +494,19 @@ export default function App() {
 
           <button
             onClick={triggerSimulation}
-            disabled={isRunning || !orchestratorLive}
+            disabled={runState === 'running' || runState === 'polling' || !orchestratorLive || !engineReady}
             className={`flex items-center gap-2 px-4 py-2 rounded-lg font-bold text-xs shadow-lg transition-all ${
-              isRunning 
+              runState === 'running' || runState === 'polling'
                 ? 'bg-slate-700 text-slate-300 cursor-not-allowed' 
+                : !orchestratorLive || !engineReady
+                ? 'bg-slate-800 text-slate-500 cursor-not-allowed border border-white/5'
                 : 'bg-gradient-to-r from-rose-600 to-rose-500 hover:from-rose-500 hover:to-rose-400 text-white shadow-rose-600/30 active:scale-95'
             }`}
           >
-            {isRunning ? (
+            {runState === 'running' || runState === 'polling' ? (
               <>
                 <RefreshCw className="w-3.5 h-3.5 animate-spin" />
-                <span>Simulating Chaos...</span>
+                <span>{runState === 'running' ? 'Simulating...' : 'Collecting Metrics...'}</span>
               </>
             ) : (
               <>
@@ -273,9 +518,9 @@ export default function App() {
         </div>
       </header>
 
-      {/* Explainer Drawer / Modal (For recruiters & engineers) */}
+      {/* Explainer Drawer */}
       {showExplainer && (
-        <div className="bg-gradient-to-r from-slate-900 via-rose-950/30 to-slate-900 border-b border-rose-500/20 px-6 py-4 transition-all">
+        <div className="bg-gradient-to-r from-slate-900 via-rose-950/30 to-slate-900 border-b border-rose-500/20 px-6 py-4">
           <div className="max-w-6xl mx-auto flex items-start justify-between gap-6">
             <div className="flex gap-4">
               <div className="w-8 h-8 rounded-lg bg-rose-500/20 flex items-center justify-center flex-shrink-0 mt-0.5">
@@ -283,14 +528,14 @@ export default function App() {
               </div>
               <div className="text-xs space-y-1.5 text-slate-300">
                 <p className="font-bold text-white text-sm">
-                  What is this project solving?
+                  Deterministic Distributed Failure Simulation
                 </p>
                 <p>
-                  In distributed systems (Netflix, Uber, Amazon), engineers cannot safely crash production servers to test resilience. 
-                  <strong className="text-white"> Faultline is a virtual flight simulator</strong>: it models microservices, queues, worker concurrency, and network partitions entirely in a sub-millisecond C++ discrete-event engine.
+                  Distributed systems architectures cannot safely crash critical database or payment nodes in production.
+                  Faultline is a virtual testbench modeled in a high-performance C++ discrete-event core: it executes virtual clocks, thread concurrency pools, bounded ingress queues, and network packet propagation.
                 </p>
                 <p className="text-slate-400">
-                  Click <strong className="text-rose-400">"Run Chaos Simulation"</strong> above to see 64 shoppers hit the system, watch the payment service crash at t=300ms, and observe how the engine calculates exact drop rates and recovery latencies in milliseconds.
+                  Select an experiment preset, configure load and chaos events, then click <strong className="text-rose-400">"Run Chaos Simulation"</strong> to inspect microsecond-accurate service latencies and failure distributions.
                 </p>
               </div>
             </div>
@@ -304,6 +549,31 @@ export default function App() {
         </div>
       )}
 
+      {/* Visible Error Notification Banner */}
+      {errorMessage && (
+        <div className="bg-rose-950/80 border-b border-rose-500/50 px-6 py-3 flex items-center justify-between">
+          <div className="flex items-center gap-3 text-xs text-rose-200">
+            <AlertCircle className="w-4 h-4 text-rose-400 flex-shrink-0" />
+            <span>{errorMessage}</span>
+          </div>
+          <div className="flex items-center gap-2">
+            <button 
+              onClick={triggerSimulation}
+              className="text-xs px-2.5 py-1 bg-rose-600 hover:bg-rose-500 text-white rounded font-medium flex items-center gap-1"
+            >
+              <RotateCcw className="w-3 h-3" />
+              <span>Retry</span>
+            </button>
+            <button 
+              onClick={() => setErrorMessage(null)}
+              className="text-xs text-rose-300 hover:text-white px-2 py-1"
+            >
+              Close
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* Main Workspace */}
       <main className="flex-1 max-w-7xl mx-auto w-full px-6 py-6 flex flex-col gap-6">
         
@@ -312,7 +582,7 @@ export default function App() {
           <div className="flex items-center gap-3">
             <div className="flex items-center gap-2 text-xs font-bold uppercase tracking-wider text-slate-400">
               <Sliders className="w-4 h-4 text-rose-400" />
-              <span>Experiment Presets:</span>
+              <span>Presets:</span>
             </div>
             
             <div className="flex flex-wrap gap-2">
@@ -324,7 +594,7 @@ export default function App() {
                     : 'bg-slate-800/60 text-slate-400 hover:text-white border border-white/5'
                 }`}
               >
-                🛍️ Black Friday Crash (Dual Outage)
+                🛍️ Black Friday Outage
               </button>
               
               <button
@@ -335,7 +605,7 @@ export default function App() {
                     : 'bg-slate-800/60 text-slate-400 hover:text-white border border-white/5'
                 }`}
               >
-                🌊 High-Load Retry Storm (140 RPS)
+                🌊 Retry Storm Under Outage (120 RPS + Retries)
               </button>
 
               <button
@@ -357,15 +627,27 @@ export default function App() {
                     : 'bg-slate-800/60 text-slate-400 hover:text-white border border-white/5'
                 }`}
               >
-                🟢 Healthy Baseline (100% Uptime)
+                🟢 Healthy Baseline
               </button>
             </div>
           </div>
 
-          {/* Quick Fine-Tuning Controls */}
-          <div className="flex items-center gap-6 text-xs text-slate-300">
+          {/* Fine-Tuning Controls */}
+          <div className="flex flex-wrap items-center gap-5 text-xs text-slate-300">
+            {/* Seed input for deterministic reproducibility */}
+            <div className="flex items-center gap-1.5 bg-slate-900 px-2.5 py-1 rounded-lg border border-white/5">
+              <Hash className="w-3.5 h-3.5 text-slate-400" />
+              <span className="text-slate-400">Seed:</span>
+              <input 
+                type="number" 
+                value={seed}
+                onChange={(e) => setSeed(parseInt(e.target.value) || 0)}
+                className="w-14 bg-transparent font-mono font-bold text-white text-right focus:outline-none"
+              />
+            </div>
+
             <div className="flex items-center gap-2">
-              <span className="text-slate-400">Traffic Load:</span>
+              <span className="text-slate-400">Load:</span>
               <span className="font-mono font-bold text-white bg-slate-800 px-2 py-0.5 rounded">{rps} RPS</span>
             </div>
 
@@ -376,7 +658,7 @@ export default function App() {
                 onChange={(e) => setCrashPayment(e.target.checked)}
                 className="rounded bg-slate-800 border-slate-700 text-rose-500 focus:ring-rose-500" 
               />
-              <span className={crashPayment ? 'text-rose-400 font-semibold' : 'text-slate-500'}>Crash Payment Node</span>
+              <span className={crashPayment ? 'text-rose-400 font-semibold' : 'text-slate-500'}>Crash Payment</span>
             </label>
 
             <label className="flex items-center gap-2 cursor-pointer select-none">
@@ -386,61 +668,70 @@ export default function App() {
                 onChange={(e) => setCutNetwork(e.target.checked)}
                 className="rounded bg-slate-800 border-slate-700 text-amber-500 focus:ring-amber-500" 
               />
-              <span className={cutNetwork ? 'text-amber-400 font-semibold' : 'text-slate-500'}>Sever Network Link</span>
+              <span className={cutNetwork ? 'text-amber-400 font-semibold' : 'text-slate-500'}>Sever Link</span>
+            </label>
+
+            <label className="flex items-center gap-2 cursor-pointer select-none">
+              <input 
+                type="checkbox" 
+                checked={enableRetries} 
+                onChange={(e) => setEnableRetries(e.target.checked)}
+                className="rounded bg-slate-800 border-slate-700 text-sky-500 focus:ring-sky-500" 
+              />
+              <span className={enableRetries ? 'text-sky-400 font-semibold' : 'text-slate-500'}>Client Retries (Storm)</span>
             </label>
           </div>
         </section>
 
-        {/* Executive Incident Post-Mortem Report Card */}
-        {analysis && (
+        {/* Dynamic Incident Post-Mortem Report Card */}
+        {incident && analysis && (
           <div className="bg-gradient-to-r from-[#0d131f] via-[#111927] to-[#0d131f] border border-white/10 rounded-xl p-5 shadow-lg flex flex-col md:flex-row md:items-center justify-between gap-4">
             <div className="flex items-start gap-4">
-              <div className={`w-10 h-10 rounded-xl flex items-center justify-center flex-shrink-0 ${
-                analysis.availability_percent >= 90 ? 'bg-emerald-500/20 text-emerald-400' : 'bg-rose-500/20 text-rose-400'
-              }`}>
-                {analysis.availability_percent >= 90 ? <ShieldCheck className="w-5 h-5" /> : <AlertTriangle className="w-5 h-5" />}
+              <div className="w-10 h-10 rounded-xl flex items-center justify-center flex-shrink-0 bg-slate-800/80">
+                {incident.icon}
               </div>
               <div className="space-y-1">
                 <div className="flex items-center gap-2">
                   <span className="font-bold text-white text-sm">
-                    {analysis.availability_percent >= 90 ? 'System Healthy: Normal Operations' : `Incident Detected: Outage on ${analysis.bottleneck_diagnosis.primary_bottleneck_node}`}
+                    {incident.title}
                   </span>
-                  <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${
-                    analysis.availability_percent >= 90 ? 'bg-emerald-500/20 text-emerald-400' : 'bg-rose-500/20 text-rose-400'
-                  }`}>
-                    {analysis.availability_percent >= 90 ? 'SEV-4 LOW' : 'SEV-1 CRITICAL'}
+                  <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${incident.badgeStyle}`}>
+                    {incident.sev}
                   </span>
                 </div>
                 <p className="text-xs text-slate-400">
-                  {analysis.availability_percent >= 90 
-                    ? 'All requests successfully completed across the topology with zero queue overflow drops.'
-                    : `At t=300ms, the ${analysis.bottleneck_diagnosis.primary_bottleneck_node} failed. ${analysis.failed_requests} out of ${analysis.total_requests} client requests dropped. Recommended mitigation: Deploy Circuit Breaker with Exponential Jitter.`
-                  }
+                  {incident.description}
                 </p>
               </div>
             </div>
 
-            <div className="flex items-center gap-6 border-t md:border-t-0 md:border-l border-white/10 pt-3 md:pt-0 md:pl-6 text-xs">
+            <div className="flex items-center gap-6 border-t md:border-t-0 md:border-l border-white/10 pt-3 md:pt-0 md:pl-6 text-xs font-mono">
               <div>
-                <span className="text-slate-500 block text-[11px]">Primary Culprit</span>
-                <span className="font-mono font-bold text-rose-400 uppercase">{analysis.bottleneck_diagnosis.primary_bottleneck_node || 'None'}</span>
+                <span className="text-slate-500 block text-[11px] font-sans">Primary Culprit</span>
+                <span className="font-bold text-rose-400 uppercase">
+                  {analysis.bottleneck_diagnosis.primary_bottleneck_node || 'None'}
+                </span>
               </div>
               <div>
-                <span className="text-slate-500 block text-[11px]">Cause</span>
-                <span className="font-mono font-bold text-amber-400">{analysis.bottleneck_diagnosis.primary_failure_cause || 'Healthy'}</span>
+                <span className="text-slate-500 block text-[11px] font-sans">Cause</span>
+                <span className="font-bold text-amber-400">
+                  {analysis.bottleneck_diagnosis.primary_failure_cause || 'Healthy'}
+                </span>
               </div>
               <div>
-                <span className="text-slate-500 block text-[11px]">Recovered in</span>
-                <span className="font-mono font-bold text-sky-400">250 ms</span>
+                <span className="text-slate-500 block text-[11px] font-sans">Chaos Duration</span>
+                <span className="font-bold text-sky-400">
+                  {rawResults?.chaos_events?.[0]?.duration_ms ? `${rawResults.chaos_events[0].duration_ms} ms` : '—'}
+                </span>
               </div>
             </div>
           </div>
         )}
 
-        {/* 4 Core Reliability Metric Cards */}
+        {/* 4 Core SLA & Reliability Metric Cards */}
         <section className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
           
-          <div className="bg-[#0d131f] border border-white/10 rounded-xl p-5 shadow-lg relative overflow-hidden">
+          <div className="bg-[#0d131f] border border-white/10 rounded-xl p-5 shadow-lg">
             <div className="flex items-center justify-between text-xs font-semibold text-slate-400">
               <span>SYSTEM RELIABILITY INDEX</span>
               <Gauge className="w-4 h-4 text-sky-400" />
@@ -448,9 +739,9 @@ export default function App() {
             <div className={`text-3xl font-extrabold font-mono mt-3 ${
               analysis ? (analysis.reliability_index >= 80 ? 'text-emerald-400' : 'text-amber-400') : 'text-slate-600'
             }`}>
-              {analysis ? `${analysis.reliability_index}%` : '--'}
+              {analysis ? `${analysis.reliability_index}%` : '—'}
             </div>
-            <div className="text-[11px] text-slate-500 mt-1">Weighted SLA Uptime & Latency score</div>
+            <div className="text-[11px] text-slate-500 mt-1">Weighted SLA Uptime & Latency index</div>
           </div>
 
           <div className="bg-[#0d131f] border border-white/10 rounded-xl p-5 shadow-lg">
@@ -461,7 +752,7 @@ export default function App() {
             <div className={`text-3xl font-extrabold font-mono mt-3 ${
               analysis ? (analysis.availability_percent >= 90 ? 'text-emerald-400' : 'text-rose-400') : 'text-slate-600'
             }`}>
-              {analysis ? `${analysis.availability_percent}%` : '--'}
+              {analysis ? `${analysis.availability_percent}%` : '—'}
             </div>
             <div className="text-[11px] text-slate-500 mt-1">
               {analysis ? `${analysis.successful_requests} / ${analysis.total_requests} client requests fulfilled` : 'No run loaded'}
@@ -476,10 +767,10 @@ export default function App() {
             <div className="text-3xl font-extrabold font-mono mt-3 text-white">
               {analysis?.latency_summary 
                 ? `${analysis.latency_summary.p50.toFixed(1)} / ${analysis.latency_summary.p95.toFixed(1)} ms` 
-                : '--'}
+                : '—'}
             </div>
             <div className="text-[11px] text-slate-500 mt-1">
-              Min: {analysis?.latency_summary?.min.toFixed(1) || '--'} ms | Max: {analysis?.latency_summary?.max.toFixed(1) || '--'} ms
+              Min: {analysis?.latency_summary?.min !== undefined ? `${analysis.latency_summary.min.toFixed(1)} ms` : '—'} | Max: {analysis?.latency_summary?.max !== undefined ? `${analysis.latency_summary.max.toFixed(1)} ms` : '—'}
             </div>
           </div>
 
@@ -489,16 +780,18 @@ export default function App() {
               <AlertTriangle className="w-4 h-4 text-amber-400" />
             </div>
             <div className="text-2xl font-extrabold font-mono mt-3 text-amber-400 uppercase tracking-tight">
-              {analysis?.bottleneck_diagnosis?.primary_bottleneck_node || 'All Healthy'}
+              {analysis?.bottleneck_diagnosis?.primary_bottleneck_node || (analysis ? 'All Healthy' : '—')}
             </div>
             <div className="text-[11px] text-rose-400 font-semibold mt-1">
-              {analysis?.bottleneck_diagnosis?.primary_failure_cause ? `Drops: ${analysis.bottleneck_diagnosis.total_node_drops} (${analysis.bottleneck_diagnosis.primary_failure_cause})` : 'Zero drops'}
+              {analysis?.bottleneck_diagnosis?.primary_failure_cause && analysis.bottleneck_diagnosis.primary_failure_cause !== 'NONE'
+                ? `Drops: ${analysis.bottleneck_diagnosis.total_node_drops ?? 0} (${analysis.bottleneck_diagnosis.primary_failure_cause})` 
+                : analysis ? 'Zero drops' : '—'}
             </div>
           </div>
 
         </section>
 
-        {/* Interactive Main Canvas Tabs */}
+        {/* Main Canvas & Diagnostic Tabs */}
         <section className="bg-[#0d131f] border border-white/10 rounded-xl p-6 flex flex-col gap-6 shadow-xl">
           
           <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-4 border-b border-white/10">
@@ -508,7 +801,7 @@ export default function App() {
                 <span>Simulated Microservice Topology Canvas</span>
               </h2>
               <p className="text-xs text-slate-400 mt-0.5">
-                Visualizing discrete-event queues, thread concurrency pools, and packet flow across the network.
+                Dynamic rendering of discrete-event ingress queues, worker concurrency pools, and packet delivery.
               </p>
             </div>
 
@@ -542,10 +835,18 @@ export default function App() {
             </div>
           </div>
 
-          {/* TAB 1: Visual Architecture Map */}
+          {/* TAB 1: Visual Architecture Map (Populated dynamically from selected experiment) */}
           {activeTab === 'topology' && (
             <div className="relative py-12 px-6 flex flex-col lg:flex-row items-center justify-center gap-8 bg-gradient-to-b from-slate-900/40 to-slate-950/60 rounded-xl border border-dashed border-white/10 overflow-hidden">
               
+              {/* Pre-run indicator banner */}
+              {!rawResults && (
+                <div className="absolute top-3 left-4 flex items-center gap-1.5 text-[10px] uppercase font-bold tracking-wider px-2.5 py-1 rounded bg-sky-500/10 text-sky-300 border border-sky-500/20">
+                  <Info className="w-3 h-3 text-sky-400" />
+                  <span>Architecture Preview (Pre-Run)</span>
+                </div>
+              )}
+
               {/* Node 1: API Gateway */}
               <div className="w-64 bg-[#111927] border border-slate-700/80 rounded-xl p-4 shadow-xl flex flex-col gap-3 relative z-10 hover:border-sky-500/50 transition-all">
                 <div className="flex items-center justify-between">
@@ -554,13 +855,13 @@ export default function App() {
                     <span className="font-mono font-bold text-xs text-white">api-gateway</span>
                   </div>
                   <span className="text-[10px] font-bold px-2 py-0.5 rounded bg-emerald-500/20 text-emerald-400 font-mono">
-                    {analysis?.node_health_scores?.['api-gateway'] || 100}% HEALTH
+                    {analysis?.node_health_scores?.['api-gateway'] !== undefined ? `${analysis.node_health_scores['api-gateway']}% HEALTH` : '100% HEALTH'}
                   </span>
                 </div>
-                <p className="text-[11px] text-slate-400">Kong / Envoy Edge Proxy</p>
+                <p className="text-[11px] text-slate-400">Edge Gateway / Envoy Ingress</p>
                 <div className="border-t border-white/5 pt-2.5 flex items-center justify-between text-[11px] text-slate-400 font-mono">
-                  <span>Workers: 8</span>
-                  <span>Queue: 0/50</span>
+                  <span>Workers: {rawResults?.nodes?.['api-gateway']?.concurrency ?? 8}</span>
+                  <span>Peak Queue: {rawResults?.nodes?.['api-gateway']?.peak_queue_depth ?? 0}/{rawResults?.nodes?.['api-gateway']?.queue_capacity ?? 50}</span>
                 </div>
               </div>
 
@@ -573,7 +874,7 @@ export default function App() {
                   <div className="w-6 h-full bg-sky-400 rounded flow-packet"></div>
                 </div>
                 <span className="text-[10px] text-slate-500 font-mono">
-                  Delivered: {rawResults?.links?.['link-gw-order']?.delivered || 64}
+                  Delivered: {rawResults?.links?.['link-gw-order']?.delivered ?? (rawResults ? 0 : '—')}
                 </span>
               </div>
 
@@ -585,60 +886,78 @@ export default function App() {
                     <span className="font-mono font-bold text-xs text-white">order-service</span>
                   </div>
                   <span className="text-[10px] font-bold px-2 py-0.5 rounded bg-emerald-500/20 text-emerald-400 font-mono">
-                    {analysis?.node_health_scores?.['order-service'] || 100}% HEALTH
+                    {analysis?.node_health_scores?.['order-service'] !== undefined ? `${analysis.node_health_scores['order-service']}% HEALTH` : '100% HEALTH'}
                   </span>
                 </div>
                 <p className="text-[11px] text-slate-400">Order State Machine & Cart</p>
                 <div className="border-t border-white/5 pt-2.5 flex items-center justify-between text-[11px] text-slate-400 font-mono">
-                  <span>Workers: 4</span>
-                  <span>Queue: 0/20</span>
+                  <span>Workers: {rawResults?.nodes?.['order-service']?.concurrency ?? 4}</span>
+                  <span>Peak Queue: {rawResults?.nodes?.['order-service']?.peak_queue_depth ?? 0}/{rawResults?.nodes?.['order-service']?.queue_capacity ?? 20}</span>
                 </div>
               </div>
 
               {/* Connecting Link 2: Chaos Zone (Partition) */}
-              <div className="flex flex-col items-center gap-1">
-                <span className={`text-[10px] font-mono font-bold px-2 py-0.5 rounded border ${
-                  cutNetwork 
-                    ? 'bg-rose-500/20 text-rose-300 border-rose-500/40 animate-pulse' 
-                    : 'bg-sky-500/10 text-sky-400 border-sky-500/20'
-                }`}>
-                  {cutNetwork ? `PARTITION (${rawResults?.links?.['link-order-payment']?.dropped_partition || 12} drops)` : '10ms (±2ms)'}
-                </span>
-                <div className={`w-20 h-1 rounded relative overflow-hidden ${cutNetwork ? 'bg-rose-950 border border-rose-600/30' : 'bg-slate-800'}`}>
-                  {!cutNetwork && <div className="w-6 h-full bg-sky-400 rounded flow-packet"></div>}
-                </div>
-                <span className="text-[10px] font-mono text-slate-500">
-                  {cutNetwork ? 'Link severed t=600ms' : 'Delivered: 52'}
-                </span>
-              </div>
+              {(() => {
+                const partitionDrops = rawResults?.links?.['link-order-payment']?.dropped_partition ?? (rawResults ? 0 : null);
+                const isSevered = partitionDrops !== null ? partitionDrops > 0 : cutNetwork;
+
+                return (
+                  <div className="flex flex-col items-center gap-1">
+                    <span className={`text-[10px] font-mono font-bold px-2 py-0.5 rounded border ${
+                      isSevered 
+                        ? 'bg-rose-500/20 text-rose-300 border-rose-500/40 animate-pulse' 
+                        : 'bg-sky-500/10 text-sky-400 border-sky-500/20'
+                    }`}>
+                      {isSevered 
+                        ? `PARTITION (${partitionDrops ?? 0} drops)` 
+                        : '10ms (±2ms)'}
+                    </span>
+                    <div className={`w-20 h-1 rounded relative overflow-hidden ${isSevered ? 'bg-rose-950 border border-rose-600/30' : 'bg-slate-800'}`}>
+                      {!isSevered && <div className="w-6 h-full bg-sky-400 rounded flow-packet"></div>}
+                    </div>
+                    <span className="text-[10px] font-mono text-slate-500">
+                      Delivered: {rawResults?.links?.['link-order-payment']?.delivered ?? (rawResults ? 0 : '—')}
+                    </span>
+                  </div>
+                );
+              })()}
 
               {/* Node 3: Payment Service (Target Node) */}
-              <div className={`w-64 bg-[#111927] rounded-xl p-4 shadow-xl flex flex-col gap-3 relative z-10 transition-all ${
-                crashPayment 
-                  ? 'border-2 border-rose-500 shadow-rose-900/30 glow-rose' 
-                  : 'border border-slate-700/80 hover:border-emerald-500/50'
-              }`}>
-                <div className="flex items-center justify-between">
-                  <div className="flex items-center gap-2">
-                    <Server className={`w-4 h-4 ${crashPayment ? 'text-rose-400' : 'text-emerald-400'}`} />
-                    <span className="font-mono font-bold text-xs text-white">payment-service</span>
-                  </div>
-                  <span className={`text-[10px] font-bold px-2 py-0.5 rounded font-mono ${
-                    crashPayment ? 'bg-rose-500/20 text-rose-300 border border-rose-500/30' : 'bg-emerald-500/20 text-emerald-400'
+              {(() => {
+                const paymentDrops = rawResults?.nodes?.['payment-service'] 
+                  ? (rawResults.nodes['payment-service'].dropped_crashed + rawResults.nodes['payment-service'].dropped_queue_full)
+                  : null;
+                const hasCrash = paymentDrops !== null ? paymentDrops > 0 : crashPayment;
+
+                return (
+                  <div className={`w-64 bg-[#111927] rounded-xl p-4 shadow-xl flex flex-col gap-3 relative z-10 transition-all ${
+                    hasCrash 
+                      ? 'border-2 border-rose-500 shadow-rose-900/30' 
+                      : 'border border-slate-700/80 hover:border-emerald-500/50'
                   }`}>
-                    {crashPayment ? 'CRASH INJECTED' : 'ONLINE'}
-                  </span>
-                </div>
-                <p className={`text-[11px] font-semibold ${crashPayment ? 'text-rose-400' : 'text-slate-400'}`}>
-                  {crashPayment ? 'Died for 250ms at t=300ms' : 'Card Processor & Database'}
-                </p>
-                <div className="border-t border-white/5 pt-2.5 flex items-center justify-between text-[11px] text-slate-400 font-mono">
-                  <span>Workers: 2</span>
-                  <span className={crashPayment ? 'text-rose-400 font-bold' : ''}>
-                    Drops: {analysis?.bottleneck_diagnosis?.total_node_drops || 20}
-                  </span>
-                </div>
-              </div>
+                    <div className="flex items-center justify-between">
+                      <div className="flex items-center gap-2">
+                        <Server className={`w-4 h-4 ${hasCrash ? 'text-rose-400' : 'text-emerald-400'}`} />
+                        <span className="font-mono font-bold text-xs text-white">payment-service</span>
+                      </div>
+                      <span className={`text-[10px] font-bold px-2 py-0.5 rounded font-mono ${
+                        hasCrash ? 'bg-rose-500/20 text-rose-300 border border-rose-500/30' : 'bg-emerald-500/20 text-emerald-400'
+                      }`}>
+                        {hasCrash ? 'CRASH RECORDED' : 'ONLINE'}
+                      </span>
+                    </div>
+                    <p className={`text-[11px] font-semibold ${hasCrash ? 'text-rose-400' : 'text-slate-400'}`}>
+                      {hasCrash ? 'Outage injected during run' : 'Card Processor & Database'}
+                    </p>
+                    <div className="border-t border-white/5 pt-2.5 flex items-center justify-between text-[11px] text-slate-400 font-mono">
+                      <span>Workers: {rawResults?.nodes?.['payment-service']?.concurrency ?? 2}</span>
+                      <span className={hasCrash ? 'text-rose-400 font-bold' : ''}>
+                        Drops: {paymentDrops ?? (rawResults ? 0 : '—')}
+                      </span>
+                    </div>
+                  </div>
+                );
+              })()}
 
             </div>
           )}
@@ -649,34 +968,70 @@ export default function App() {
               
               <div className="bg-[#070b14] p-5 rounded-xl border border-white/5 flex flex-col gap-4">
                 <h3 className="text-xs font-bold uppercase tracking-wider text-slate-400">
-                  Where Did Customers Fail? (Failure Attribution)
+                  Where Did Requests Fail? (Attribution Breakdown)
                 </h3>
                 
-                <div className="space-y-4">
-                  <div>
-                    <div className="flex justify-between text-xs mb-1.5">
-                      <span className="text-rose-400 font-medium">NODE_DOWN (Payment Server Was Dead)</span>
-                      <span className="font-mono font-bold text-white">
-                        {rawResults?.metrics?.failure_breakdown?.NODE_DOWN || 20} reqs (62.5%)
-                      </span>
-                    </div>
-                    <div className="w-full h-2 bg-slate-800 rounded-full overflow-hidden">
-                      <div className="w-[62.5%] h-full bg-rose-500 rounded-full"></div>
-                    </div>
-                  </div>
+                {(() => {
+                  const nodeDown = rawResults?.metrics?.failure_breakdown?.NODE_DOWN ?? 0;
+                  const nodeCrashProcess = rawResults?.metrics?.failure_breakdown?.NODE_CRASHED_DURING_PROCESS ?? 0;
+                  const netPartition = rawResults?.metrics?.failure_breakdown?.NETWORK_PARTITION ?? 0;
+                  const queueFull = rawResults?.metrics?.failure_breakdown?.QUEUE_FULL ?? 0;
+                  const totalFailed = rawResults?.metrics?.failed_requests ?? 0;
 
-                  <div>
-                    <div className="flex justify-between text-xs mb-1.5">
-                      <span className="text-amber-400 font-medium">NETWORK_PARTITION (Order ↔ Payment Cable Cut)</span>
-                      <span className="font-mono font-bold text-white">
-                        {rawResults?.metrics?.failure_breakdown?.NETWORK_PARTITION || 12} reqs (37.5%)
-                      </span>
+                  if (totalFailed === 0) {
+                    return (
+                      <div className="py-8 text-center text-slate-500 text-xs">
+                        Zero request failures recorded in this simulation run.
+                      </div>
+                    );
+                  }
+
+                  const nodeDownPct = totalFailed > 0 ? ((nodeDown + nodeCrashProcess) / totalFailed * 100).toFixed(1) : '0';
+                  const partitionPct = totalFailed > 0 ? (netPartition / totalFailed * 100).toFixed(1) : '0';
+                  const queuePct = totalFailed > 0 ? (queueFull / totalFailed * 100).toFixed(1) : '0';
+
+                  return (
+                    <div className="space-y-4">
+                      <div>
+                        <div className="flex justify-between text-xs mb-1.5">
+                          <span className="text-rose-400 font-medium">NODE_DOWN / CRASHED IN-FLIGHT</span>
+                          <span className="font-mono font-bold text-white">
+                            {nodeDown + nodeCrashProcess} reqs ({nodeDownPct}%)
+                          </span>
+                        </div>
+                        <div className="w-full h-2 bg-slate-800 rounded-full overflow-hidden">
+                          <div style={{ width: `${nodeDownPct}%` }} className="h-full bg-rose-500 rounded-full"></div>
+                        </div>
+                      </div>
+
+                      <div>
+                        <div className="flex justify-between text-xs mb-1.5">
+                          <span className="text-amber-400 font-medium">NETWORK_PARTITION</span>
+                          <span className="font-mono font-bold text-white">
+                            {netPartition} reqs ({partitionPct}%)
+                          </span>
+                        </div>
+                        <div className="w-full h-2 bg-slate-800 rounded-full overflow-hidden">
+                          <div style={{ width: `${partitionPct}%` }} className="h-full bg-amber-500 rounded-full"></div>
+                        </div>
+                      </div>
+
+                      {queueFull > 0 && (
+                        <div>
+                          <div className="flex justify-between text-xs mb-1.5">
+                            <span className="text-orange-400 font-medium">QUEUE_FULL (Backpressure Rejection)</span>
+                            <span className="font-mono font-bold text-white">
+                              {queueFull} reqs ({queuePct}%)
+                            </span>
+                          </div>
+                          <div className="w-full h-2 bg-slate-800 rounded-full overflow-hidden">
+                            <div style={{ width: `${queuePct}%` }} className="h-full bg-orange-500 rounded-full"></div>
+                          </div>
+                        </div>
+                      )}
                     </div>
-                    <div className="w-full h-2 bg-slate-800 rounded-full overflow-hidden">
-                      <div className="w-[37.5%] h-full bg-amber-500 rounded-full"></div>
-                    </div>
-                  </div>
-                </div>
+                  );
+                })()}
 
                 <p className="text-[11px] text-slate-500 mt-2">
                   Discrete-event attribution allows identifying exact points of failure without sampling noise.
@@ -689,121 +1044,198 @@ export default function App() {
                     C++ Discrete-Event Engine Performance
                   </h3>
                   
-                  <div className="space-y-2.5 text-xs">
+                  <div className="space-y-2.5 text-xs font-mono">
                     <div className="flex justify-between py-1 border-b border-white/5">
-                      <span className="text-slate-400">Simulated Virtual Time:</span>
-                      <span className="font-mono font-bold text-white">{rawResults?.simulated_time_ms ? `${rawResults.simulated_time_ms.toFixed(1)} ms` : '827.5 ms'}</span>
+                      <span className="text-slate-400 font-sans">Simulated Virtual Time:</span>
+                      <span className="font-bold text-white">
+                        {rawResults?.simulated_time_ms !== undefined ? `${rawResults.simulated_time_ms.toFixed(2)} ms` : '—'}
+                      </span>
                     </div>
                     <div className="flex justify-between py-1 border-b border-white/5">
-                      <span className="text-slate-400">Actual CPU Execution Time:</span>
-                      <span className="font-mono font-bold text-emerald-400">{rawResults?.wall_clock_time_ms ? `${rawResults.wall_clock_time_ms.toFixed(2)} ms` : '1.17 ms'}</span>
+                      <span className="text-slate-400 font-sans">Actual CPU Execution Time:</span>
+                      <span className="font-bold text-emerald-400">
+                        {rawResults?.wall_clock_time_ms !== undefined ? `${rawResults.wall_clock_time_ms.toFixed(2)} ms` : '—'}
+                      </span>
                     </div>
                     <div className="flex justify-between py-1 border-b border-white/5">
-                      <span className="text-slate-400">Discrete Events Processed:</span>
-                      <span className="font-mono font-bold text-sky-400">{rawResults?.total_events_processed || 344} events</span>
+                      <span className="text-slate-400 font-sans">Discrete Events Processed:</span>
+                      <span className="font-bold text-sky-400">
+                        {rawResults?.total_events_processed !== undefined ? `${rawResults.total_events_processed} events` : '—'}
+                      </span>
+                    </div>
+                    <div className="flex justify-between py-1 border-b border-white/5">
+                      <span className="text-slate-400 font-sans">Deterministic Seed:</span>
+                      <span className="font-bold text-purple-400">
+                        {rawResults?.seed ?? seed}
+                      </span>
                     </div>
                   </div>
                 </div>
 
                 <div className="bg-slate-900/80 p-3 rounded-lg border border-white/5 mt-4 flex items-center justify-between">
                   <span className="text-xs font-bold text-slate-300">Simulation Speedup Factor:</span>
-                  <span className="font-mono font-bold text-purple-400 text-sm">~707x faster than real-time</span>
+                  <span className="font-mono font-bold text-purple-400 text-sm">
+                    {rawResults?.simulated_time_ms && rawResults?.wall_clock_time_ms && rawResults.wall_clock_time_ms > 0
+                      ? `~${Math.round(rawResults.simulated_time_ms / rawResults.wall_clock_time_ms)}x faster than real-time`
+                      : '—'}
+                  </span>
                 </div>
               </div>
 
             </div>
           )}
 
-          {/* TAB 3: A/B Strategy Comparison (Why Netflix & Uber use this) */}
+          {/* TAB 3: Dynamic A/B Strategy Comparison */}
           {activeTab === 'comparison' && (
-            <div className="flex flex-col gap-4">
+            <div className="flex flex-col gap-5">
               
-              <div className="bg-sky-950/20 border border-sky-500/30 p-4 rounded-xl flex items-center justify-between">
-                <div className="flex items-center gap-3">
-                  <div className="w-8 h-8 rounded-lg bg-amber-500/20 flex items-center justify-center">
+              {/* Header Action Bar */}
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 p-4 rounded-xl bg-slate-900/50 border border-white/5">
+                <div>
+                  <h3 className="text-xs font-bold uppercase tracking-wider text-white flex items-center gap-2">
                     <Trophy className="w-4 h-4 text-amber-400" />
-                  </div>
-                  <div>
-                    <h4 className="text-xs font-bold text-white">Strategy B (Circuit Breaker + Jitter) Wins</h4>
-                    <p className="text-[11px] text-slate-400">Under identical Black Friday traffic and payment service outages.</p>
-                  </div>
-                </div>
-
-                <div className="flex gap-2">
-                  <span className="text-xs font-bold font-mono px-3 py-1 rounded-full bg-emerald-500/20 text-emerald-300 border border-emerald-500/30">
-                    +41.5% Uptime
-                  </span>
-                  <span className="text-xs font-bold font-mono px-3 py-1 rounded-full bg-sky-500/20 text-sky-300 border border-sky-500/30">
-                    -20.3ms p95 Latency
-                  </span>
-                </div>
-              </div>
-
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                
-                {/* Strategy A */}
-                <div className="bg-[#070b14] border border-rose-500/20 rounded-xl p-5 flex flex-col gap-3">
-                  <div className="flex items-center justify-between">
-                    <span className="text-xs font-bold text-rose-400">Strategy A: Naive Linear Retries</span>
-                    <span className="text-[10px] font-bold px-2 py-0.5 rounded bg-rose-500/10 text-rose-400">BASELINE</span>
-                  </div>
-
-                  <div className="space-y-2 text-xs">
-                    <div className="flex justify-between py-1 border-b border-white/5">
-                      <span className="text-slate-400">Availability:</span>
-                      <span className="font-mono font-bold text-rose-400">50.0%</span>
-                    </div>
-                    <div className="flex justify-between py-1 border-b border-white/5">
-                      <span className="text-slate-400">p95 Latency:</span>
-                      <span className="font-mono font-bold text-white">42.4 ms</span>
-                    </div>
-                    <div className="flex justify-between py-1 border-b border-white/5">
-                      <span className="text-slate-400">Requests Dropped:</span>
-                      <span className="font-mono font-bold text-rose-400">32 requests</span>
-                    </div>
-                    <div className="flex justify-between py-1">
-                      <span className="text-slate-400">Downstream Impact:</span>
-                      <span className="font-bold text-rose-400">Retry Storm Exhaustion</span>
-                    </div>
-                  </div>
-
-                  <p className="text-[11px] text-slate-500 mt-2 border-t border-white/5 pt-2">
-                    Retries immediately upon failure, causing queued requests to multiply and keeping the payment-service from recovering.
+                    <span>Live A/B Strategy Benchmark</span>
+                  </h3>
+                  <p className="text-xs text-slate-400 mt-0.5">
+                    Execute Strategy A (Naive) vs Strategy B (Resilient Backoff) under identical chaos conditions to measure empirical improvement.
                   </p>
                 </div>
 
-                {/* Strategy B */}
-                <div className="bg-[#070b14] border border-emerald-500/30 rounded-xl p-5 flex flex-col gap-3 shadow-lg shadow-emerald-950/20">
-                  <div className="flex items-center justify-between">
-                    <span className="text-xs font-bold text-emerald-400">Strategy B: Circuit Breaker + Jitter</span>
-                    <span className="text-[10px] font-bold px-2 py-0.5 rounded bg-emerald-500/20 text-emerald-300 font-bold">PRODUCTION RECOMMENDED</span>
+                <button
+                  onClick={runLiveComparison}
+                  disabled={isComparing || !orchestratorLive || !analyticsLive}
+                  className={`px-4 py-2 rounded-lg text-xs font-bold flex items-center gap-2 shadow-lg transition-all ${
+                    isComparing 
+                      ? 'bg-slate-700 text-slate-400 cursor-not-allowed'
+                      : 'bg-sky-600 hover:bg-sky-500 text-white shadow-sky-600/20 active:scale-95'
+                  }`}
+                >
+                  {isComparing ? (
+                    <>
+                      <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                      <span>Benchmarking Both Strategies...</span>
+                    </>
+                  ) : (
+                    <>
+                      <Play className="w-3.5 h-3.5 fill-current" />
+                      <span>Run Live A/B Benchmark</span>
+                    </>
+                  )}
+                </button>
+              </div>
+
+              {/* Dynamic Comparison Results or Empty State */}
+              {comparisonData ? (
+                <div className="flex flex-col gap-4">
+                  {/* Winner Banner */}
+                  <div className="bg-sky-950/20 border border-sky-500/30 p-4 rounded-xl flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+                    <div className="flex items-center gap-3">
+                      <div className="w-9 h-9 rounded-lg bg-amber-500/20 flex items-center justify-center flex-shrink-0">
+                        <Trophy className="w-5 h-5 text-amber-400" />
+                      </div>
+                      <div>
+                        <h4 className="text-xs font-bold text-white">
+                          Winner: Strategy {comparisonData.comparison_summary.winning_strategy}
+                        </h4>
+                        <p className="text-[11px] text-slate-400">
+                          Evaluated by Python FastAPI statistical engine under identical seed ({seed}) and fault conditions.
+                        </p>
+                      </div>
+                    </div>
+
+                    <div className="flex items-center gap-2">
+                      <span className="text-xs font-bold font-mono px-3 py-1 rounded-full bg-emerald-500/20 text-emerald-300 border border-emerald-500/30">
+                        {comparisonData.comparison_summary.availability_improvement_pct >= 0 ? '+' : ''}
+                        {comparisonData.comparison_summary.availability_improvement_pct}% Uptime
+                      </span>
+                      <span className="text-xs font-bold font-mono px-3 py-1 rounded-full bg-sky-500/20 text-sky-300 border border-sky-500/30">
+                        {comparisonData.comparison_summary.p95_latency_delta_ms.toFixed(1)}ms p95 Delta
+                      </span>
+                    </div>
                   </div>
 
-                  <div className="space-y-2 text-xs">
-                    <div className="flex justify-between py-1 border-b border-white/5">
-                      <span className="text-slate-400">Availability:</span>
-                      <span className="font-mono font-bold text-emerald-400">91.5%</span>
-                    </div>
-                    <div className="flex justify-between py-1 border-b border-white/5">
-                      <span className="text-slate-400">p95 Latency:</span>
-                      <span className="font-mono font-bold text-emerald-400">22.1 ms</span>
-                    </div>
-                    <div className="flex justify-between py-1 border-b border-white/5">
-                      <span className="text-slate-400">Requests Dropped:</span>
-                      <span className="font-mono font-bold text-emerald-400">6 requests</span>
-                    </div>
-                    <div className="flex justify-between py-1">
-                      <span className="text-slate-400">Circuit State:</span>
-                      <span className="font-mono font-bold text-sky-400">Tripped OPEN at t=310ms</span>
-                    </div>
-                  </div>
+                  {/* 2 Comparison Cards */}
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    
+                    {/* Strategy A */}
+                    <div className="bg-[#070b14] border border-rose-500/20 rounded-xl p-5 flex flex-col gap-3">
+                      <div className="flex items-center justify-between">
+                        <span className="text-xs font-bold text-rose-400">Strategy A: Baseline (Naive)</span>
+                        <span className="text-[10px] font-bold px-2 py-0.5 rounded bg-rose-500/10 text-rose-400">BASELINE</span>
+                      </div>
 
-                  <p className="text-[11px] text-slate-400 mt-2 border-t border-white/5 pt-2">
-                    Fails fast during the outage, shedding load from payment-service so it can reboot and recover instantly without thread pool lockup.
+                      <div className="space-y-2 text-xs">
+                        <div className="flex justify-between py-1 border-b border-white/5">
+                          <span className="text-slate-400">Availability:</span>
+                          <span className="font-mono font-bold text-rose-400">
+                            {comparisonData.strategy_a.availability_percent.toFixed(1)}%
+                          </span>
+                        </div>
+                        <div className="flex justify-between py-1 border-b border-white/5">
+                          <span className="text-slate-400">p95 Latency:</span>
+                          <span className="font-mono font-bold text-white">
+                            {comparisonData.strategy_a.p95_latency_ms.toFixed(1)} ms
+                          </span>
+                        </div>
+                        <div className="flex justify-between py-1">
+                          <span className="text-slate-400">Requests Dropped:</span>
+                          <span className="font-mono font-bold text-rose-400">
+                            {comparisonData.strategy_a.failed_requests} requests
+                          </span>
+                        </div>
+                      </div>
+
+                      <p className="text-[11px] text-slate-500 mt-2 border-t border-white/5 pt-2">
+                        Zero retries and lower queue concurrency, leading to early dropouts during node outages.
+                      </p>
+                    </div>
+
+                    {/* Strategy B */}
+                    <div className="bg-[#070b14] border border-emerald-500/30 rounded-xl p-5 flex flex-col gap-3 shadow-lg shadow-emerald-950/20">
+                      <div className="flex items-center justify-between">
+                        <span className="text-xs font-bold text-emerald-400">Strategy B: Resilient Architecture</span>
+                        <span className="text-[10px] font-bold px-2 py-0.5 rounded bg-emerald-500/20 text-emerald-300 font-bold">RECOMMENDED</span>
+                      </div>
+
+                      <div className="space-y-2 text-xs">
+                        <div className="flex justify-between py-1 border-b border-white/5">
+                          <span className="text-slate-400">Availability:</span>
+                          <span className="font-mono font-bold text-emerald-400">
+                            {comparisonData.strategy_b.availability_percent.toFixed(1)}%
+                          </span>
+                        </div>
+                        <div className="flex justify-between py-1 border-b border-white/5">
+                          <span className="text-slate-400">p95 Latency:</span>
+                          <span className="font-mono font-bold text-emerald-400">
+                            {comparisonData.strategy_b.p95_latency_ms.toFixed(1)} ms
+                          </span>
+                        </div>
+                        <div className="flex justify-between py-1">
+                          <span className="text-slate-400">Requests Dropped:</span>
+                          <span className="font-mono font-bold text-emerald-400">
+                            {comparisonData.strategy_b.failed_requests} requests
+                          </span>
+                        </div>
+                      </div>
+
+                      <p className="text-[11px] text-slate-400 mt-2 border-t border-white/5 pt-2">
+                        Bounded retries with backoff and increased worker concurrency protect uptime during the crash window.
+                      </p>
+                    </div>
+
+                  </div>
+                </div>
+              ) : (
+                <div className="bg-[#070b14] border border-white/5 rounded-xl p-10 flex flex-col items-center justify-center text-center gap-3">
+                  <div className="w-12 h-12 rounded-xl bg-slate-800/60 flex items-center justify-center text-sky-400">
+                    <Zap className="w-6 h-6" />
+                  </div>
+                  <h4 className="text-sm font-bold text-white">No Comparison Run Executed Yet</h4>
+                  <p className="text-xs text-slate-400 max-w-md">
+                    Click <strong>"Run Live A/B Benchmark"</strong> above. Faultline will dispatch Strategy A and Strategy B into the engine with the exact same workload and seed, then invoke the Python comparison service to compute real uptime and latency deltas.
                   </p>
                 </div>
-
-              </div>
+              )}
 
             </div>
           )}
@@ -840,7 +1272,7 @@ export default function App() {
                 </div>
 
                 <div className="flex items-center gap-4 text-xs font-mono">
-                  <span className="text-slate-400">{exp.duration_ms ? `${exp.duration_ms.toFixed(1)} ms` : '--'}</span>
+                  <span className="text-slate-400">{exp.duration_ms ? `${exp.duration_ms.toFixed(1)} ms` : '—'}</span>
                   <span className="text-[10px] font-bold px-2 py-0.5 rounded bg-emerald-500/20 text-emerald-300">
                     {exp.status}
                   </span>

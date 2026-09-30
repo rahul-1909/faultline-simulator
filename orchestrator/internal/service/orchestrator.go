@@ -245,3 +245,19 @@ func (o *Orchestrator) CancelExperiment(id string) error {
 	cancel()
 	return nil
 }
+
+// EngineReady verifies whether the C++ discrete-event engine binary exists and is accessible.
+func (o *Orchestrator) EngineReady() (bool, string) {
+	if o.engineBinary == "" {
+		return false, "engine binary path not configured"
+	}
+	info, err := os.Stat(o.engineBinary)
+	if err != nil {
+		return false, "engine binary not found: " + err.Error()
+	}
+	if info.IsDir() {
+		return false, "engine binary path is a directory"
+	}
+	return true, "ready"
+}
+

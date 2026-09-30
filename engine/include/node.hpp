@@ -77,6 +77,7 @@ namespace faultline
             // 1. If server is crashed, drop immediately
             if (state_ == NodeState::CRASHED)
             {
+                req->state = RequestState::FAILED;
                 req->is_failed = true;
                 req->failure_reason = "NODE_DOWN";
                 stats_.requests_dropped_crashed++;
@@ -93,6 +94,7 @@ namespace faultline
             // 3. Workers are busy. Check if ingress queue has space
             if (ingress_queue_.size() >= queue_capacity_)
             {
+                req->state = RequestState::FAILED;
                 req->is_failed = true;
                 req->failure_reason = "QUEUE_FULL";
                 stats_.requests_dropped_queue_full++;
@@ -119,6 +121,7 @@ namespace faultline
             {
                 auto item = std::move(ingress_queue_.front());
                 ingress_queue_.pop_front();
+                item.req->state = RequestState::FAILED;
                 item.req->is_failed = true;
                 item.req->failure_reason = "NODE_CRASHED_DURING_WAIT";
                 stats_.requests_dropped_crashed++;
@@ -140,6 +143,9 @@ namespace faultline
         const std::string &id() const { return id_; }
         NodeState state() const { return state_; }
         size_t active_workers() const { return active_workers_; }
+        size_t concurrency_limit() const { return concurrency_limit_; }
+        size_t queue_capacity() const { return queue_capacity_; }
+        SimTime service_time_us() const { return base_service_time_us_; }
         size_t current_queue_size() const { return ingress_queue_.size(); }
         const NodeStats &stats() const { return stats_; }
 
@@ -169,6 +175,7 @@ namespace faultline
             // If server crashed while processing, discard result
             if (state_ == NodeState::CRASHED)
             {
+                req->state = RequestState::FAILED;
                 req->is_failed = true;
                 req->failure_reason = "NODE_CRASHED_DURING_PROCESS";
                 stats_.requests_dropped_crashed++;

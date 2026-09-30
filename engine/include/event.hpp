@@ -54,6 +54,21 @@ inline std::string event_type_to_string(EventType type) {
     }
 }
 
+enum class RequestState {
+    IN_FLIGHT,
+    SUCCEEDED,
+    FAILED
+};
+
+inline std::string request_state_to_string(RequestState state) {
+    switch (state) {
+        case RequestState::IN_FLIGHT: return "IN_FLIGHT";
+        case RequestState::SUCCEEDED: return "SUCCEEDED";
+        case RequestState::FAILED:    return "FAILED";
+        default:                      return "UNKNOWN";
+    }
+}
+
 /**
  * Represents a single request traveling through the distributed system.
  */
@@ -62,6 +77,7 @@ struct Request {
     std::string trace_id;          // Distributed tracing identifier (like OpenTelemetry / Jaeger)
     SimTime created_at{0};         // Sim timestamp when client sent request
     SimTime completed_at{0};       // Sim timestamp when response received
+    RequestState state{RequestState::IN_FLIGHT};
     bool is_failed{false};         // Flagged true if dropped, timed out, or crashed
     std::string failure_reason;    // "TIMEOUT", "NODE_DOWN", "QUEUE_FULL", "NETWORK_LOSS"
     int retry_count{0};            // How many times this request has been retried

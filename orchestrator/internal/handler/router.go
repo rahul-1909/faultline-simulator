@@ -27,10 +27,13 @@ func (h *APIHandler) RegisterRoutes(mux *http.ServeMux) {
 }
 
 func (h *APIHandler) handleHealth(w http.ResponseWriter, r *http.Request) {
+	ready, reason := h.orch.EngineReady()
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"status":    "healthy",
-		"service":   "faultline-orchestrator",
-		"timestamp": time.Now().UTC(),
+		"status":        "healthy",
+		"service":       "faultline-orchestrator",
+		"engine_ready":  ready,
+		"engine_status": reason,
+		"timestamp":     time.Now().UTC(),
 	})
 }
 

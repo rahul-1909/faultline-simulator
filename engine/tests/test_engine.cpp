@@ -107,6 +107,32 @@ void test_sequential_service_hops() {
     std::cout << "PASSED (Completed at 30ms)\n";
 }
 
+void test_request_state_tracking() {
+    std::cout << "[TEST] Explicit RequestState tracking & in-flight crash... ";
+    Scheduler sched;
+    Node node("crash-node", 1, 5, MS_TO_US(20)); // 20ms processing
+
+    auto req = std::make_shared<Request>();
+    req->id = 202;
+    assert(req->state == RequestState::IN_FLIGHT);
+
+    node.receive_request(sched, req);
+    assert(req->state == RequestState::IN_FLIGHT);
+
+    // Crash the node at 10ms (while worker is midway through 20ms processing)
+    sched.schedule_at(MS_TO_US(10), EventType::NODE_CRASH, "crash-node", nullptr, [&node]() {
+        node.crash();
+    });
+
+    sched.run_until(MS_TO_US(50));
+
+    // When the 20ms completion event triggers, it detects node crashed, sets FAILED
+    assert(req->state == RequestState::FAILED);
+    assert(req->is_failed);
+    assert(req->failure_reason == "NODE_CRASHED_DURING_PROCESS");
+    std::cout << "PASSED (State=FAILED, reason=NODE_CRASHED_DURING_PROCESS)\n";
+}
+
 int main() {
     std::cout << "=========================================================\n";
     std::cout << "  RUNNING FAULTLINE C++ ENGINE UNIT TESTS\n";
@@ -116,8 +142,9 @@ int main() {
     test_node_queue_overflow();
     test_link_partition();
     test_sequential_service_hops();
+    test_request_state_tracking();
 
-    std::cout << "\nALL C++ UNIT TESTS PASSED! (4/4)\n";
+    std::cout << "\nALL C++ UNIT TESTS PASSED! (5/5)\n";
     std::cout << "=========================================================\n";
     return 0;
 }

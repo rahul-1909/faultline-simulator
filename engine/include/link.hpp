@@ -72,6 +72,7 @@ namespace faultline
             // 1. Check for complete Network Partition (Split-Brain)
             if (state_ == LinkState::PARTITIONED)
             {
+                req->state = RequestState::FAILED;
                 req->is_failed = true;
                 req->failure_reason = "NETWORK_PARTITION";
                 stats_.packets_dropped_partition++;
@@ -81,6 +82,7 @@ namespace faultline
             // 2. Check for probabilistic packet drop
             if (drop_rate_ > 0.0 && dist_uniform_(rng_) < drop_rate_)
             {
+                req->state = RequestState::FAILED;
                 req->is_failed = true;
                 req->failure_reason = "PACKET_LOSS";
                 stats_.packets_dropped_loss++;
@@ -122,6 +124,9 @@ namespace faultline
         const std::string &id() const { return id_; }
         const std::string &source_id() const { return source_id_; }
         const std::string &target_id() const { return target_id_; }
+        SimTime base_latency_us() const { return base_latency_us_; }
+        SimTime jitter_us() const { return jitter_us_; }
+        double drop_rate() const { return drop_rate_; }
         LinkState state() const { return state_; }
         const LinkStats &stats() const { return stats_; }
 

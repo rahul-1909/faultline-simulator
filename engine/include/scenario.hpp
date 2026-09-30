@@ -53,6 +53,7 @@ namespace faultline
         {
             json out;
             out["scenario_name"] = scenario_json_.value("name", "Unnamed Scenario");
+            out["seed"] = scenario_json_.value("seed", 42);
             out["simulated_time_ms"] = US_TO_MS(scheduler_.current_time());
             out["wall_clock_time_ms"] = scheduler_.last_wall_duration_ms();
             out["total_events_processed"] = scheduler_.total_events_processed();
@@ -65,15 +66,20 @@ namespace faultline
 
             for (const auto &req : all_requests_)
             {
-                if (req->is_failed)
-                {
-                    failed++;
-                    failure_reasons[req->failure_reason]++;
-                }
-                else if (req->completed_at > 0)
+                if (req->state == RequestState::SUCCEEDED && req->completed_at > 0)
                 {
                     success++;
                     latencies_ms.push_back(US_TO_MS(req->completed_at - req->created_at));
+                }
+                else
+                {
+                    failed++;
+                    std::string reason = req->failure_reason;
+                    if (reason.empty())
+                    {
+                        reason = (req->state == RequestState::IN_FLIGHT) ? "TIMEOUT_UNFINISHED" : "FAILED_UNKNOWN";
+                    }
+                    failure_reasons[reason]++;
                 }
             }
 
@@ -94,7 +100,7 @@ namespace faultline
                 out["metrics"]["latency_ms"]["max"] = latencies_ms.back();
             }
 
-            // Per-node stats
+            // Per-node stats & actual simulated topology state
             for (const auto &[id, node] : nodes_)
             {
                 const auto &s = node->stats();
@@ -103,10 +109,15 @@ namespace faultline
                     {"processed", s.requests_processed},
                     {"dropped_queue_full", s.requests_dropped_queue_full},
                     {"dropped_crashed", s.requests_dropped_crashed},
-                    {"peak_queue_depth", s.peak_queue_depth}};
+                    {"peak_queue_depth", s.peak_queue_depth},
+                    {"active_workers", node->active_workers()},
+                    {"concurrency", node->concurrency_limit()},
+                    {"queue_capacity", node->queue_capacity()},
+                    {"service_time_ms", US_TO_MS(node->service_time_us())},
+                    {"final_state", node_state_to_string(node->state())}};
             }
 
-            // Per-link stats
+            // Per-link stats & actual simulated topology state
             for (const auto &[id, link] : links_)
             {
                 const auto &s = link->stats();
@@ -114,7 +125,23 @@ namespace faultline
                     {"transmitted", s.packets_transmitted},
                     {"delivered", s.packets_delivered},
                     {"dropped_partition", s.packets_dropped_partition},
-                    {"dropped_loss", s.packets_dropped_loss}};
+                    {"dropped_loss", s.packets_dropped_loss},
+                    {"source", link->source_id()},
+                    {"target", link->target_id()},
+                    {"latency_ms", US_TO_MS(link->base_latency_us())},
+                    {"jitter_ms", US_TO_MS(link->jitter_us())},
+                    {"drop_rate", link->drop_rate()},
+                    {"final_state", link_state_to_string(link->state())}};
+            }
+
+            // Copy chaos timeline
+            if (scenario_json_.contains("chaos"))
+            {
+                out["chaos_events"] = scenario_json_["chaos"];
+            }
+            else
+            {
+                out["chaos_events"] = json::array();
             }
 
             std::ofstream out_file(output_filepath);
@@ -130,8 +157,132 @@ namespace faultline
         }
 
     private:
+        struct RetryPolicy
+        {
+            int max_retries{0};
+            SimTime backoff_ms{25};
+            double backoff_multiplier{1.5};
+            SimTime jitter_ms{5};
+        };
+
+        bool validate_scenario()
+        {
+            if (!scenario_json_.is_object())
+            {
+                std::cerr << "[Validation Error] Scenario root must be a JSON object.\n";
+                return false;
+            }
+
+            // Duration check
+            if (scenario_json_.value("duration_ms", 1000ULL) == 0)
+            {
+                std::cerr << "[Validation Error] duration_ms must be greater than 0.\n";
+                return false;
+            }
+
+            // Nodes check
+            if (!scenario_json_.contains("nodes") || !scenario_json_["nodes"].is_array() || scenario_json_["nodes"].empty())
+            {
+                std::cerr << "[Validation Error] 'nodes' must be a non-empty array.\n";
+                return false;
+            }
+
+            std::unordered_map<std::string, bool> node_ids;
+            for (const auto &n : scenario_json_["nodes"])
+            {
+                if (!n.is_object() || !n.contains("id") || !n["id"].is_string() || n["id"].get<std::string>().empty())
+                {
+                    std::cerr << "[Validation Error] Every node must have a non-empty string 'id'.\n";
+                    return false;
+                }
+                std::string id = n["id"];
+                if (node_ids.count(id))
+                {
+                    std::cerr << "[Validation Error] Duplicate node id detected: " << id << "\n";
+                    return false;
+                }
+                node_ids[id] = true;
+
+                if (n.value("concurrency", 4) <= 0)
+                {
+                    std::cerr << "[Validation Error] Node " << id << " concurrency must be > 0.\n";
+                    return false;
+                }
+            }
+
+            // Links check
+            if (scenario_json_.contains("links") && scenario_json_["links"].is_array())
+            {
+                std::unordered_map<std::string, bool> link_ids;
+                for (const auto &l : scenario_json_["links"])
+                {
+                    if (!l.contains("id") || !l.contains("source") || !l.contains("target"))
+                    {
+                        std::cerr << "[Validation Error] Every link must define id, source, and target.\n";
+                        return false;
+                    }
+                    std::string lid = l["id"];
+                    std::string src = l["source"];
+                    std::string tgt = l["target"];
+                    if (link_ids.count(lid))
+                    {
+                        std::cerr << "[Validation Error] Duplicate link id detected: " << lid << "\n";
+                        return false;
+                    }
+                    link_ids[lid] = true;
+
+                    if (!node_ids.count(src))
+                    {
+                        std::cerr << "[Validation Error] Link " << lid << " source node '" << src << "' does not exist.\n";
+                        return false;
+                    }
+                    if (!node_ids.count(tgt))
+                    {
+                        std::cerr << "[Validation Error] Link " << lid << " target node '" << tgt << "' does not exist.\n";
+                        return false;
+                    }
+                }
+            }
+
+            // Workload check
+            if (scenario_json_.contains("workload") && scenario_json_["workload"].is_object())
+            {
+                const auto &w = scenario_json_["workload"];
+                double rps = w.value("requests_per_second", 50.0);
+                if (rps <= 0.0)
+                {
+                    std::cerr << "[Validation Error] requests_per_second must be positive.\n";
+                    return false;
+                }
+                if (w.contains("route"))
+                {
+                    std::vector<std::string> route = w["route"];
+                    if (route.empty())
+                    {
+                        std::cerr << "[Validation Error] Workload route cannot be empty.\n";
+                        return false;
+                    }
+                    for (const auto &nid : route)
+                    {
+                        if (!node_ids.count(nid))
+                        {
+                            std::cerr << "[Validation Error] Workload route references non-existent node: " << nid << "\n";
+                            return false;
+                        }
+                    }
+                }
+            }
+
+            return true;
+        }
+
         bool setup()
         {
+            if (!validate_scenario())
+            {
+                return false;
+            }
+
             uint32_t seed = scenario_json_.value("seed", 42);
 
             // 1. Construct Nodes
@@ -158,7 +309,7 @@ namespace faultline
                 links_[id] = std::make_unique<NetworkLink>(id, src, tgt, latency_us, jitter_us, drop_rate, seed++);
             }
 
-            // 3. Setup Traffic Generator (Workload)
+            // 3. Setup Traffic Generator (Workload) & Retry Policy
             if (scenario_json_.contains("workload"))
             {
                 const auto &w = scenario_json_["workload"];
@@ -167,6 +318,15 @@ namespace faultline
                 SimTime start_us = MS_TO_US(w.value("start_time_ms", 0ULL));
                 SimTime duration_us = MS_TO_US(w.value("duration_ms", 1000ULL));
                 std::vector<std::string> route = w.value("route", std::vector<std::string>{});
+
+                if (w.contains("retry_policy"))
+                {
+                    const auto &rp = w["retry_policy"];
+                    retry_policy_.max_retries = rp.value("max_retries", 0);
+                    retry_policy_.backoff_ms = rp.value("backoff_ms", 25ULL);
+                    retry_policy_.backoff_multiplier = rp.value("backoff_multiplier", 1.5);
+                    retry_policy_.jitter_ms = rp.value("jitter_ms", 5ULL);
+                }
 
                 SimTime cur_t = start_us;
                 uint64_t req_id = 1;
@@ -226,6 +386,28 @@ namespace faultline
             return true;
         }
 
+        void handle_failure(std::shared_ptr<Request> req, const std::vector<std::string> &route)
+        {
+            if (retry_policy_.max_retries > 0 && req->retry_count < retry_policy_.max_retries)
+            {
+                req->retry_count++;
+                SimTime backoff_us = MS_TO_US(static_cast<SimTime>(retry_policy_.backoff_ms * std::pow(retry_policy_.backoff_multiplier, req->retry_count - 1)));
+                scheduler_.schedule(backoff_us, EventType::REQUEST_GENERATED, "client_retry", req, [this, req, route]()
+                                    {
+                    req->state = RequestState::IN_FLIGHT;
+                    req->is_failed = false;
+                    this->dispatch_request(req, route, 0); });
+                return;
+            }
+
+            req->state = RequestState::FAILED;
+            req->is_failed = true;
+            if (req->retry_count > 0 && req->retry_count >= retry_policy_.max_retries)
+            {
+                req->failure_reason += " (RETRIES_EXHAUSTED)";
+            }
+        }
+
         /**
          * Recursively traverses request across the route hops (Gateway -> Order -> Payment).
          * Each node's processing completion triggers the next hop link transmission.
@@ -234,6 +416,7 @@ namespace faultline
         {
             if (hop_idx >= route.size())
             {
+                req->state = RequestState::SUCCEEDED;
                 req->completed_at = scheduler_.current_time();
                 return;
             }
@@ -241,11 +424,12 @@ namespace faultline
             const std::string &current_node_id = route[hop_idx];
             auto &current_node = nodes_[current_node_id];
 
-            current_node->receive_request(scheduler_, req, [this, route, hop_idx, current_node_id](std::shared_ptr<Request> processed_req)
+            current_node->receive_request(scheduler_, req, [this, req, route, hop_idx, current_node_id](std::shared_ptr<Request> processed_req)
             {
-                if (processed_req->is_failed)
+                if (processed_req->state == RequestState::FAILED || processed_req->is_failed)
                 {
-                    return; // Request failed during processing
+                    this->handle_failure(processed_req, route);
+                    return;
                 }
 
                 // If there's a next hop, find the link connecting them
@@ -266,6 +450,11 @@ namespace faultline
                     {
                         found_link->transmit(scheduler_, processed_req, [this, route, hop_idx](std::shared_ptr<Request> delivered_req)
                         {
+                            if (delivered_req->state == RequestState::FAILED || delivered_req->is_failed)
+                            {
+                                this->handle_failure(delivered_req, route);
+                                return;
+                            }
                             this->dispatch_request(delivered_req, route, hop_idx + 1);
                         });
                     }
@@ -278,13 +467,21 @@ namespace faultline
                 else
                 {
                     // All hops completed and final node finished processing
+                    processed_req->state = RequestState::SUCCEEDED;
                     processed_req->completed_at = scheduler_.current_time();
                 }
             });
+
+            // If node dropped immediately (e.g. node down or queue full)
+            if (req->state == RequestState::FAILED || req->is_failed)
+            {
+                handle_failure(req, route);
+            }
         }
 
         Scheduler scheduler_;
         json scenario_json_;
+        RetryPolicy retry_policy_;
         std::unordered_map<std::string, std::unique_ptr<Node>> nodes_;
         std::unordered_map<std::string, std::unique_ptr<NetworkLink>> links_;
         std::vector<std::shared_ptr<Request>> all_requests_;
