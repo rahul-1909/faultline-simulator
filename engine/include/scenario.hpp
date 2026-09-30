@@ -228,6 +228,7 @@ namespace faultline
 
         /**
          * Recursively traverses request across the route hops (Gateway -> Order -> Payment).
+         * Each node's processing completion triggers the next hop link transmission.
          */
         void dispatch_request(std::shared_ptr<Request> req, const std::vector<std::string> &route, size_t hop_idx)
         {
@@ -240,42 +241,46 @@ namespace faultline
             const std::string &current_node_id = route[hop_idx];
             auto &current_node = nodes_[current_node_id];
 
-            current_node->receive_request(scheduler_, req);
-
-            if (req->is_failed)
+            current_node->receive_request(scheduler_, req, [this, route, hop_idx, current_node_id](std::shared_ptr<Request> processed_req)
             {
-                return; // Request dropped at current node
-            }
-
-            // If there's a next hop, find the link connecting them
-            if (hop_idx + 1 < route.size())
-            {
-                const std::string &next_node_id = route[hop_idx + 1];
-                NetworkLink *found_link = nullptr;
-                for (auto &[id, link] : links_)
+                if (processed_req->is_failed)
                 {
-                    if (link->source_id() == current_node_id && link->target_id() == next_node_id)
-                    {
-                        found_link = link.get();
-                        break;
-                    }
+                    return; // Request failed during processing
                 }
 
-                if (found_link)
+                // If there's a next hop, find the link connecting them
+                if (hop_idx + 1 < route.size())
                 {
-                    found_link->transmit(scheduler_, req, [this, req, route, hop_idx](std::shared_ptr<Request> delivered_req)
-                                         { this->dispatch_request(delivered_req, route, hop_idx + 1); });
+                    const std::string &next_node_id = route[hop_idx + 1];
+                    NetworkLink *found_link = nullptr;
+                    for (auto &[id, link] : links_)
+                    {
+                        if (link->source_id() == current_node_id && link->target_id() == next_node_id)
+                        {
+                            found_link = link.get();
+                            break;
+                        }
+                    }
+
+                    if (found_link)
+                    {
+                        found_link->transmit(scheduler_, processed_req, [this, route, hop_idx](std::shared_ptr<Request> delivered_req)
+                        {
+                            this->dispatch_request(delivered_req, route, hop_idx + 1);
+                        });
+                    }
+                    else
+                    {
+                        // Direct hop if no explicit link configured
+                        this->dispatch_request(processed_req, route, hop_idx + 1);
+                    }
                 }
                 else
                 {
-                    // Direct hop if no explicit link configured
-                    dispatch_request(req, route, hop_idx + 1);
+                    // All hops completed and final node finished processing
+                    processed_req->completed_at = scheduler_.current_time();
                 }
-            }
-            else
-            {
-                req->completed_at = scheduler_.current_time();
-            }
+            });
         }
 
         Scheduler scheduler_;

@@ -44,6 +44,14 @@ namespace faultline
         size_t peak_queue_depth{0};
     };
 
+    using NodeCompletionCallback = std::function<void(std::shared_ptr<Request>)>;
+
+    struct QueuedItem
+    {
+        std::shared_ptr<Request> req;
+        NodeCompletionCallback on_complete;
+    };
+
     /**
      * Represents a simulated Service/Server Node in the distributed topology.
      */
@@ -60,8 +68,9 @@ namespace faultline
 
         /**
          * Entry point: called when a request arrives at this node's ingress.
+         * on_complete is executed ONLY after this node finishes processing the request.
          */
-        void receive_request(Scheduler &scheduler, std::shared_ptr<Request> req)
+        void receive_request(Scheduler &scheduler, std::shared_ptr<Request> req, NodeCompletionCallback on_complete = nullptr)
         {
             stats_.requests_received++;
 
@@ -77,7 +86,7 @@ namespace faultline
             // 2. If workers are available, start processing right away
             if (active_workers_ < concurrency_limit_)
             {
-                start_processing(scheduler, std::move(req));
+                start_processing(scheduler, std::move(req), std::move(on_complete));
                 return;
             }
 
@@ -90,8 +99,8 @@ namespace faultline
                 return;
             }
 
-            // 4. Enqueue request to wait for an available worker
-            ingress_queue_.push_back(std::move(req));
+            // 4. Enqueue request with its completion callback to wait for an available worker
+            ingress_queue_.push_back({std::move(req), std::move(on_complete)});
             if (ingress_queue_.size() > stats_.peak_queue_depth)
             {
                 stats_.peak_queue_depth = ingress_queue_.size();
@@ -108,10 +117,10 @@ namespace faultline
             // Purge queued requests as failed
             while (!ingress_queue_.empty())
             {
-                auto req = ingress_queue_.front();
+                auto item = std::move(ingress_queue_.front());
                 ingress_queue_.pop_front();
-                req->is_failed = true;
-                req->failure_reason = "NODE_CRASHED_DURING_WAIT";
+                item.req->is_failed = true;
+                item.req->failure_reason = "NODE_CRASHED_DURING_WAIT";
                 stats_.requests_dropped_crashed++;
             }
         }
@@ -138,7 +147,7 @@ namespace faultline
         /**
          * Dispatches a worker to process the request and schedules its completion event.
          */
-        void start_processing(Scheduler &scheduler, std::shared_ptr<Request> req)
+        void start_processing(Scheduler &scheduler, std::shared_ptr<Request> req, NodeCompletionCallback on_complete)
         {
             active_workers_++;
 
@@ -148,31 +157,39 @@ namespace faultline
                                   : base_service_time_us_;
 
             // Schedule the PROCESS_COMPLETE event in the scheduler
-            scheduler.schedule(latency, EventType::PROCESS_COMPLETE, id_, req, [this, &scheduler, req]()
-                               { this->on_process_complete(scheduler, req); });
+            scheduler.schedule(latency, EventType::PROCESS_COMPLETE, id_, req, [this, &scheduler, req, on_complete]()
+                               { this->on_process_complete(scheduler, req, on_complete); });
         }
 
         /**
          * Called when a worker finishes computing a request.
          */
-        void on_process_complete(Scheduler &scheduler, std::shared_ptr<Request> req)
+        void on_process_complete(Scheduler &scheduler, std::shared_ptr<Request> req, NodeCompletionCallback on_complete)
         {
             // If server crashed while processing, discard result
             if (state_ == NodeState::CRASHED)
             {
+                req->is_failed = true;
+                req->failure_reason = "NODE_CRASHED_DURING_PROCESS";
+                stats_.requests_dropped_crashed++;
                 return;
             }
 
-            req->completed_at = scheduler.current_time();
             stats_.requests_processed++;
             active_workers_--;
+
+            // Trigger the next hop now that this service has finished processing!
+            if (on_complete)
+            {
+                on_complete(req);
+            }
 
             // If there are pending requests in the ingress queue, grab the next one!
             if (!ingress_queue_.empty())
             {
-                auto next_req = ingress_queue_.front();
+                auto next_item = std::move(ingress_queue_.front());
                 ingress_queue_.pop_front();
-                start_processing(scheduler, std::move(next_req));
+                start_processing(scheduler, std::move(next_item.req), std::move(next_item.on_complete));
             }
         }
 
@@ -182,7 +199,7 @@ namespace faultline
         SimTime base_service_time_us_;
         NodeState state_;
         size_t active_workers_;
-        std::deque<std::shared_ptr<Request>> ingress_queue_;
+        std::deque<QueuedItem> ingress_queue_;
         NodeStats stats_;
     };
 

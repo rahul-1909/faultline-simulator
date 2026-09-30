@@ -76,6 +76,37 @@ void test_link_partition() {
     std::cout << "PASSED\n";
 }
 
+void test_sequential_service_hops() {
+    std::cout << "[TEST] Sequential service processing across hops... ";
+    Scheduler sched;
+    Node node_a("node-a", 2, 10, MS_TO_US(10)); // 10ms service
+    Node node_b("node-b", 2, 10, MS_TO_US(15)); // 15ms service
+    NetworkLink link("link-ab", "node-a", "node-b", MS_TO_US(5), 0, 0.0, 42); // 5ms link latency
+
+    auto req = std::make_shared<Request>();
+    req->id = 101;
+    req->created_at = 0;
+
+    // Dispatch: Node A -> Link -> Node B
+    node_a.receive_request(sched, req, [&](std::shared_ptr<Request> r1) {
+        link.transmit(sched, r1, [&](std::shared_ptr<Request> r2) {
+            node_b.receive_request(sched, r2, [&](std::shared_ptr<Request> r3) {
+                r3->completed_at = sched.current_time();
+            });
+        });
+    });
+
+    sched.run_until(MS_TO_US(100));
+
+    // Must finish at exactly 10ms (Node A) + 5ms (Link) + 15ms (Node B) = 30ms
+    assert(!req->is_failed);
+    assert(req->completed_at == MS_TO_US(30));
+    assert(node_a.stats().requests_processed == 1);
+    assert(node_b.stats().requests_processed == 1);
+    assert(link.stats().packets_delivered == 1);
+    std::cout << "PASSED (Completed at 30ms)\n";
+}
+
 int main() {
     std::cout << "=========================================================\n";
     std::cout << "  RUNNING FAULTLINE C++ ENGINE UNIT TESTS\n";
@@ -84,8 +115,9 @@ int main() {
     test_scheduler_ordering();
     test_node_queue_overflow();
     test_link_partition();
+    test_sequential_service_hops();
 
-    std::cout << "\nALL C++ UNIT TESTS PASSED! (3/3)\n";
+    std::cout << "\nALL C++ UNIT TESTS PASSED! (4/4)\n";
     std::cout << "=========================================================\n";
     return 0;
 }
