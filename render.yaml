@@ -38,8 +38,6 @@ services:
     runtime: static
     buildCommand: cd dashboard && npm install && npm run build
     staticPublishPath: dashboard/dist
-    plan: free
-    region: oregon
     routes:
       - type: rewrite
         source: /*
