@@ -39,6 +39,17 @@ class TestAnalytics(unittest.TestCase):
         self.assertGreater(diag["reliability_index"], 0.0)
         self.assertEqual(diag["node_health_scores"]["gw"], 100.0)
 
+    def test_analyze_empty_results(self):
+        diag = analyze_results({})
+        self.assertEqual(diag["availability_percent"], 0.0)
+        self.assertEqual(diag["total_requests"], 0)
+        self.assertEqual(diag["successful_requests"], 0)
+        self.assertEqual(diag["failed_requests"], 0)
+        self.assertIsNone(diag["bottleneck_diagnosis"]["primary_bottleneck_node"])
+        self.assertEqual(diag["bottleneck_diagnosis"]["primary_failure_cause"], "NONE")
+        self.assertEqual(diag["bottleneck_diagnosis"]["peak_queue_depth"], 0)
+        self.assertEqual(diag["bottleneck_diagnosis"]["total_node_drops"], 0)
+
     def test_compare_experiments(self):
         run_a = {"scenario_name": "No Retry", "metrics": {"availability_percent": 50.0, "latency_ms": {"p95": 80.0}, "failed_requests": 50}}
         run_b = {"scenario_name": "Circuit Breaker", "metrics": {"availability_percent": 90.0, "latency_ms": {"p95": 35.0}, "failed_requests": 10}}
@@ -46,6 +57,21 @@ class TestAnalytics(unittest.TestCase):
         self.assertEqual(comp["comparison_summary"]["winning_strategy"], "B")
         self.assertEqual(comp["comparison_summary"]["availability_improvement_pct"], 40.0)
         self.assertEqual(comp["comparison_summary"]["p95_latency_delta_ms"], -45.0)
+
+    def test_compare_tie(self):
+        run_a = {"scenario_name": "Strat A", "metrics": {"availability_percent": 95.0, "latency_ms": {"p95": 20.0}, "failed_requests": 5}}
+        run_b = {"scenario_name": "Strat B", "metrics": {"availability_percent": 95.0, "latency_ms": {"p95": 20.0}, "failed_requests": 5}}
+        comp = compare_experiments(run_a, run_b)
+        self.assertEqual(comp["comparison_summary"]["winning_strategy"], "TIE")
+        self.assertEqual(comp["comparison_summary"]["availability_improvement_pct"], 0.0)
+        self.assertEqual(comp["comparison_summary"]["p95_latency_delta_ms"], 0.0)
+
+    def test_compare_latency_tiebreaker(self):
+        run_a = {"scenario_name": "Strat A", "metrics": {"availability_percent": 95.0, "latency_ms": {"p95": 40.0}, "failed_requests": 5}}
+        run_b = {"scenario_name": "Strat B", "metrics": {"availability_percent": 95.0, "latency_ms": {"p95": 25.0}, "failed_requests": 5}}
+        comp = compare_experiments(run_a, run_b)
+        self.assertEqual(comp["comparison_summary"]["winning_strategy"], "B")
+        self.assertEqual(comp["comparison_summary"]["p95_latency_delta_ms"], -15.0)
 
 if __name__ == "__main__":
     unittest.main()

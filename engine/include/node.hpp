@@ -64,11 +64,13 @@ namespace faultline
               queue_capacity_(queue_capacity),
               base_service_time_us_(service_time_us),
               state_(NodeState::ONLINE),
-              active_workers_(0) {}
+              active_workers_(0),
+              generation_(0) {}
 
         /**
          * Entry point: called when a request arrives at this node's ingress.
-         * on_complete is executed ONLY after this node finishes processing the request.
+         * on_complete is executed ONLY after this node finishes processing the request,
+         * or immediately if the request is dropped.
          */
         void receive_request(Scheduler &scheduler, std::shared_ptr<Request> req, NodeCompletionCallback on_complete = nullptr)
         {
@@ -81,6 +83,10 @@ namespace faultline
                 req->is_failed = true;
                 req->failure_reason = "NODE_DOWN";
                 stats_.requests_dropped_crashed++;
+                if (on_complete)
+                {
+                    on_complete(req);
+                }
                 return;
             }
 
@@ -98,6 +104,10 @@ namespace faultline
                 req->is_failed = true;
                 req->failure_reason = "QUEUE_FULL";
                 stats_.requests_dropped_queue_full++;
+                if (on_complete)
+                {
+                    on_complete(req);
+                }
                 return;
             }
 
@@ -111,12 +121,14 @@ namespace faultline
 
         /**
          * Chaos injection: Crash this node immediately.
+         * Increments generation_ to invalidate all currently in-flight worker events.
          */
         void crash()
         {
             state_ = NodeState::CRASHED;
+            generation_++;
             active_workers_ = 0;
-            // Purge queued requests as failed
+            // Purge queued requests as failed and notify callers
             while (!ingress_queue_.empty())
             {
                 auto item = std::move(ingress_queue_.front());
@@ -125,6 +137,10 @@ namespace faultline
                 item.req->is_failed = true;
                 item.req->failure_reason = "NODE_CRASHED_DURING_WAIT";
                 stats_.requests_dropped_crashed++;
+                if (item.on_complete)
+                {
+                    item.on_complete(item.req);
+                }
             }
         }
 
@@ -156,6 +172,7 @@ namespace faultline
         void start_processing(Scheduler &scheduler, std::shared_ptr<Request> req, NodeCompletionCallback on_complete)
         {
             active_workers_++;
+            uint64_t job_generation = generation_;
 
             // Compute service processing latency (3x longer if degraded)
             SimTime latency = (state_ == NodeState::DEGRADED)
@@ -163,27 +180,37 @@ namespace faultline
                                   : base_service_time_us_;
 
             // Schedule the PROCESS_COMPLETE event in the scheduler
-            scheduler.schedule(latency, EventType::PROCESS_COMPLETE, id_, req, [this, &scheduler, req, on_complete]()
-                               { this->on_process_complete(scheduler, req, on_complete); });
+            scheduler.schedule(latency, EventType::PROCESS_COMPLETE, id_, req,
+                               [this, &scheduler, req, on_complete, job_generation]()
+                               {
+                                   this->on_process_complete(scheduler, req, on_complete, job_generation);
+                               });
         }
 
         /**
          * Called when a worker finishes computing a request.
          */
-        void on_process_complete(Scheduler &scheduler, std::shared_ptr<Request> req, NodeCompletionCallback on_complete)
+        void on_process_complete(Scheduler &scheduler, std::shared_ptr<Request> req, NodeCompletionCallback on_complete, uint64_t job_generation)
         {
-            // If server crashed while processing, discard result
-            if (state_ == NodeState::CRASHED)
+            // If server crashed while processing (or recovered before this stale event fired)
+            if (state_ == NodeState::CRASHED || job_generation != generation_)
             {
                 req->state = RequestState::FAILED;
                 req->is_failed = true;
                 req->failure_reason = "NODE_CRASHED_DURING_PROCESS";
                 stats_.requests_dropped_crashed++;
+                if (on_complete)
+                {
+                    on_complete(req);
+                }
                 return;
             }
 
             stats_.requests_processed++;
-            active_workers_--;
+            if (active_workers_ > 0)
+            {
+                active_workers_--;
+            }
 
             // Trigger the next hop now that this service has finished processing!
             if (on_complete)
@@ -192,7 +219,7 @@ namespace faultline
             }
 
             // If there are pending requests in the ingress queue, grab the next one!
-            if (!ingress_queue_.empty())
+            if (!ingress_queue_.empty() && state_ == NodeState::ONLINE)
             {
                 auto next_item = std::move(ingress_queue_.front());
                 ingress_queue_.pop_front();
@@ -206,6 +233,7 @@ namespace faultline
         SimTime base_service_time_us_;
         NodeState state_;
         size_t active_workers_;
+        uint64_t generation_;
         std::deque<QueuedItem> ingress_queue_;
         NodeStats stats_;
     };

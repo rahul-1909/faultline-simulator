@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  engine-tests:
+    name: C++ Discrete-Event Engine
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Build Tools
+        run: sudo apt-get update && sudo apt-get install -y g++ cmake
+      - name: Build Engine
+        run: |
+          g++ -std=c++17 -O3 -Wall -Wextra -pedantic -Iengine/include engine/src/main.cpp -o engine/faultline_engine
+      - name: Build & Run Test Suite
+        run: |
+          g++ -std=c++17 -Wall -Wextra -pedantic -Iengine/include engine/tests/test_engine.cpp -o engine/tests/test_engine
+          ./engine/tests/test_engine
+
+  orchestrator-tests:
+    name: Go Orchestrator
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+      - name: Run Tests
+        working-directory: orchestrator
+        run: |
+          go test -v -race ./...
+
+  analytics-tests:
+    name: Python Analytics Service
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install Dependencies
+        run: |
+          pip install -r analysis/requirements.txt
+      - name: Run Unit Tests
+        run: |
+          python -m unittest discover -s analysis/tests
+
+  dashboard-build:
+    name: React / TypeScript Dashboard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Install Dependencies
+        working-directory: dashboard
+        run: npm ci || npm install
+      - name: TypeScript Check & Production Build
+        working-directory: dashboard
+        run: npm run build

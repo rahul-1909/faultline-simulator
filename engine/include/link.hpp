@@ -76,6 +76,10 @@ namespace faultline
                 req->is_failed = true;
                 req->failure_reason = "NETWORK_PARTITION";
                 stats_.packets_dropped_partition++;
+                if (on_deliver)
+                {
+                    on_deliver(req);
+                }
                 return;
             }
 
@@ -86,6 +90,10 @@ namespace faultline
                 req->is_failed = true;
                 req->failure_reason = "PACKET_LOSS";
                 stats_.packets_dropped_loss++;
+                if (on_deliver)
+                {
+                    on_deliver(req);
+                }
                 return;
             }
 
@@ -108,8 +116,22 @@ namespace faultline
             // 4. Schedule the arrival of the packet at the target node
             scheduler.schedule(travel_time, EventType::NETWORK_DELIVER, target_id_, req, [this, req, on_deliver]()
                                {
+                if (this->state_ == LinkState::PARTITIONED)
+                {
+                    req->state = RequestState::FAILED;
+                    req->is_failed = true;
+                    req->failure_reason = "NETWORK_PARTITION";
+                    this->stats_.packets_dropped_partition++;
+                    if (on_deliver)
+                    {
+                        on_deliver(req);
+                    }
+                    return;
+                }
+
                 this->stats_.packets_delivered++;
-                if (on_deliver) {
+                if (on_deliver)
+                {
                     on_deliver(req);
                 } });
         }

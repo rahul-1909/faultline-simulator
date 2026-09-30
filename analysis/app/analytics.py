@@ -18,8 +18,8 @@ def analyze_results(results: Dict[str, Any]) -> Dict[str, Any]:
 
     # 1. Bottleneck Node Analysis
     bottleneck_node = None
-    max_drop = -1
-    highest_queue = -1
+    max_drop = 0
+    highest_queue = 0
     node_health_scores = {}
 
     for node_id, data in nodes.items():
@@ -31,7 +31,7 @@ def analyze_results(results: Dict[str, Any]) -> Dict[str, Any]:
         health = max(0.0, 100.0 - (drops / max(1, received) * 100.0))
         node_health_scores[node_id] = round(health, 2)
 
-        if drops > max_drop or (drops == max_drop and q_depth > highest_queue):
+        if bottleneck_node is None or drops > max_drop or (drops == max_drop and q_depth > highest_queue):
             max_drop = drops
             highest_queue = q_depth
             bottleneck_node = node_id
